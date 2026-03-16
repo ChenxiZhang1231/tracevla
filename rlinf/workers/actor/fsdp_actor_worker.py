@@ -1040,7 +1040,26 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
-            model.load_state_dict(model_dict)
+            model_state = model.state_dict()
+
+            # Filter out parameters with shape mismatch
+            filtered_dict = {}
+            skipped_keys = []
+            for k, v in model_dict.items():
+                if k in model_state:
+                    if v.shape == model_state[k].shape:
+                        filtered_dict[k] = v
+                    else:
+                        skipped_keys.append(f"{k} (ckpt: {v.shape} vs model: {model_state[k].shape})")
+                else:
+                    skipped_keys.append(f"{k} (not in model)")
+
+            # Load filtered state dict
+            missing_keys, unexpected_keys = model.load_state_dict(filtered_dict, strict=False)
+            if skipped_keys:
+                self.logger.warning(f"[CKPT] Skipped keys due to shape mismatch or not in model: {skipped_keys}")
+            if missing_keys:
+                self.logger.warning(f"[CKPT] Missing keys (will be randomly initialized): {missing_keys}")
 
         return model
 

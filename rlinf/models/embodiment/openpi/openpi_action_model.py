@@ -69,6 +69,9 @@ class OpenPi0Config(Pi0Config):
     # ===== Trace-VLA parameters =====
     use_tracevla_value: bool = False  # Use Tweedie x0_pred for value head input
     x0_value_embed_dim: int = 256     # Embedding dimension for x0_pred projection
+    # Value head mode: "suffix_x0", "full_concat", "compressed_concat"
+    tracevla_value_mode: str = "suffix_x0"
+    prefix_value_embed_dim: int = 512  # For compressed_concat mode
 
     # ===== DSRL-specific parameters =====
     use_dsrl: bool = False  # Enable DSRL algorithm
@@ -162,15 +165,36 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 # Use bfloat16 to match the backbone dtype (loaded from checkpoint later)
                 # This ensures all parameters share a single dtype for FSDP
                 _tracevla_dtype = torch.bfloat16
-                # Project flattened x0_pred to embedding space
+
+                # Project flattened x0_pred to embedding space (all modes need this)
                 x0_flat_dim = self.config.action_horizon * self.config.action_dim
                 self.x0_value_proj = nn.Linear(
                     x0_flat_dim,
                     self.config.x0_value_embed_dim,
                     bias=True
                 ).to(dtype=_tracevla_dtype)
-                # Value head input: suffix_out_mean + x0_embed
-                value_head_input_dim = proj_width + self.config.x0_value_embed_dim
+
+                # Calculate value_head_input_dim based on mode
+                suffix_dim = 1024  # proj_width when value_after_vlm=False
+                prefix_dim = 2048  # VLM output dimension for Pi0.5
+
+                if self.config.tracevla_value_mode == "suffix_x0":
+                    # Current mode: suffix + x0
+                    value_head_input_dim = suffix_dim + self.config.x0_value_embed_dim
+                elif self.config.tracevla_value_mode == "full_concat":
+                    # Full concat: prefix + suffix + x0
+                    value_head_input_dim = prefix_dim + suffix_dim + self.config.x0_value_embed_dim
+                elif self.config.tracevla_value_mode == "compressed_concat":
+                    # Compressed: compressed_prefix + suffix + x0
+                    self.prefix_value_proj = nn.Linear(
+                        prefix_dim,
+                        self.config.prefix_value_embed_dim,
+                        bias=True
+                    ).to(dtype=_tracevla_dtype)
+                    value_head_input_dim = self.config.prefix_value_embed_dim + suffix_dim + self.config.x0_value_embed_dim
+                else:
+                    raise ValueError(f"Unknown tracevla_value_mode: {self.config.tracevla_value_mode}")
+
                 # Value head with new input dim also needs bfloat16
                 self.value_head = ValueHead(
                     input_dim=value_head_input_dim,
@@ -771,6 +795,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     num_steps,
                     compute_values,
                     return_x0_pred=True,
+                    prefix_output=prefix_output,
                 )
                 stepwise_values.append(value_t)
                 stepwise_x0_pred.append(x0_pred_step)
@@ -784,6 +809,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     sample_mode,
                     num_steps,
                     compute_values,
+                    prefix_output=prefix_output,
                 )
 
             # Euler step - use new tensor assignment instead of in-place operation
@@ -881,6 +907,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         denoise_steps,
         compute_values=True,
         return_x0_pred=False,
+        prefix_output=None,
     ):
         """
         Sample the mean, variance and value of the action at a given timestep.
@@ -939,14 +966,35 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 x0_flat = x0_flat.to(dtype=x0_proj_dtype)
                 x0_embed = self.x0_value_proj(x0_flat)  # [B, x0_value_embed_dim]
 
-                # Step 4: Concatenate suffix_out and x0_embed
+                # Step 4: Prepare suffix_out_value
                 if self.config.detach_critic_input:
                     suffix_out_value = suffix_out_value.detach()
                 # Ensure suffix_out_value has same dtype as x0_embed for concatenation
                 suffix_out_value = suffix_out_value.to(dtype=x0_proj_dtype)
-                value_input = torch.cat([suffix_out_value, x0_embed], dim=-1)
 
-                # Step 5: Compute value
+                # Step 5: Construct value_input based on mode
+                if self.config.tracevla_value_mode == "suffix_x0":
+                    # Current mode: suffix + x0
+                    value_input = torch.cat([suffix_out_value, x0_embed], dim=-1)
+                elif self.config.tracevla_value_mode == "full_concat":
+                    # Full concat: prefix + suffix + x0
+                    assert prefix_output is not None, "prefix_output required for full_concat mode"
+                    prefix_mean = prefix_output.mean(dim=1).to(dtype=x0_proj_dtype)
+                    if self.config.detach_critic_input:
+                        prefix_mean = prefix_mean.detach()
+                    value_input = torch.cat([prefix_mean, suffix_out_value, x0_embed], dim=-1)
+                elif self.config.tracevla_value_mode == "compressed_concat":
+                    # Compressed concat: compressed_prefix + suffix + x0
+                    assert prefix_output is not None, "prefix_output required for compressed_concat mode"
+                    prefix_mean = prefix_output.mean(dim=1).to(dtype=x0_proj_dtype)
+                    if self.config.detach_critic_input:
+                        prefix_mean = prefix_mean.detach()
+                    prefix_embed = self.prefix_value_proj(prefix_mean)
+                    value_input = torch.cat([prefix_embed, suffix_out_value, x0_embed], dim=-1)
+                else:
+                    raise ValueError(f"Unknown tracevla_value_mode: {self.config.tracevla_value_mode}")
+
+                # Step 6: Compute value
                 value_t = self.value_head(value_input)[:, 0]
             else:
                 # Original value computation
@@ -1149,6 +1197,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 self.config.noise_method,
                 self.config.num_steps,
                 compute_values,
+                prefix_output=prefix_output,
             )
             log_probs = self.get_logprob_norm(chains_next, x_t_mean, x_t_std)
             entropy = self.gaussian_entropy(x_t_std)
