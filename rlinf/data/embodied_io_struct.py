@@ -342,6 +342,11 @@ class ChunkStepResult:
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
 
+    # ========== Trace-VLA stepwise fields ==========
+    stepwise_logprobs: torch.Tensor = None   # [B, num_denoise_steps, action_chunk, action_dim]
+    stepwise_values: torch.Tensor = None     # [B, num_denoise_steps]
+    stepwise_x0_pred: torch.Tensor = None    # [B, num_denoise_steps, action_horizon, action_dim]
+
     def __post_init__(self):
         if self.actions is not None:
             self.actions = self.actions.cpu().contiguous()
@@ -361,6 +366,13 @@ class ChunkStepResult:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
         if self.versions is not None:
             self.versions = self.versions.cpu().contiguous()
+        # Trace-VLA stepwise fields
+        if self.stepwise_logprobs is not None:
+            self.stepwise_logprobs = self.stepwise_logprobs.cpu().contiguous()
+        if self.stepwise_values is not None:
+            self.stepwise_values = self.stepwise_values.cpu().contiguous()
+        if self.stepwise_x0_pred is not None:
+            self.stepwise_x0_pred = self.stepwise_x0_pred.cpu().contiguous()
 
 
 @dataclass
@@ -384,6 +396,11 @@ class Trajectory:
 
     curr_obs: dict[str, Any] = field(default_factory=dict)
     next_obs: dict[str, Any] = field(default_factory=dict)
+
+    # ========== Trace-VLA stepwise fields ==========
+    stepwise_logprobs: torch.Tensor = None   # [T, B, num_denoise_steps, action_chunk, action_dim]
+    stepwise_values: torch.Tensor = None     # [T, B, num_denoise_steps]
+    stepwise_x0_pred: torch.Tensor = None    # [T, B, num_denoise_steps, action_horizon, action_dim]
 
     @staticmethod
     def _generate_field_mask(
@@ -532,6 +549,11 @@ class EmbodiedRolloutResult:
     curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
     next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
 
+    # ========== Trace-VLA stepwise fields ==========
+    stepwise_logprobs: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
+    stepwise_values: list[torch.Tensor] = field(default_factory=list)    # trajectory_length
+    stepwise_x0_pred: list[torch.Tensor] = field(default_factory=list)   # trajectory_length
+
     def append_step_result(self, result: ChunkStepResult):
         if result.actions is not None:
             self.actions.append(result.actions)
@@ -554,6 +576,13 @@ class EmbodiedRolloutResult:
             self.versions.append(result.versions)
         if result.forward_inputs:
             self.forward_inputs.append(result.forward_inputs)
+        # Trace-VLA stepwise fields
+        if result.stepwise_logprobs is not None:
+            self.stepwise_logprobs.append(result.stepwise_logprobs)
+        if result.stepwise_values is not None:
+            self.stepwise_values.append(result.stepwise_values)
+        if result.stepwise_x0_pred is not None:
+            self.stepwise_x0_pred.append(result.stepwise_x0_pred)
 
     def mark_last_step_with_flags(self, save_flags: torch.Tensor):
         if not self.intervene_flags:
@@ -677,6 +706,19 @@ class EmbodiedRolloutResult:
             else torch.zeros(1, dtype=torch.float32)
         )
 
+        # Trace-VLA stepwise fields
+        if len(self.stepwise_logprobs) > 0:
+            trajectory.stepwise_logprobs = (
+                torch.stack(self.stepwise_logprobs, dim=0).cpu().contiguous()
+            )
+        if len(self.stepwise_values) > 0:
+            trajectory.stepwise_values = (
+                torch.stack(self.stepwise_values, dim=0).cpu().contiguous()
+            )
+        if len(self.stepwise_x0_pred) > 0:
+            trajectory.stepwise_x0_pred = (
+                torch.stack(self.stepwise_x0_pred, dim=0).cpu().contiguous()
+            )
         return trajectory
 
     def to_splited_trajectories(self, split_size: int) -> list[Trajectory]:

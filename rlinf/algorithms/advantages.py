@@ -350,3 +350,104 @@ def compute_raw_advantages(
             advantages = (advantages - valid.mean()) / (valid.std() + 1e-5)
 
     return advantages, None
+
+
+@register_advantage("stepwise_gae")
+def compute_stepwise_gae_advantages(
+    rewards: torch.Tensor,
+    stepwise_values: torch.Tensor,
+    num_denoise_steps: int,
+    gamma: float = 1.0,
+    gae_lambda: float = 0.95,
+    normalize_advantages: bool = True,
+    loss_mask: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute Step-wise GAE advantages for Trace-VLA using λ-return.
+
+    This implements denoise-step-level advantage estimation where each denoising
+    step is treated as an action in an internal MDP. Uses TD(λ) to propagate
+    the chunk reward backwards to all denoising steps.
+
+    Key insight: In the denoising MDP, only the final step receives the real
+    chunk reward. Without λ-return, intermediate steps would only learn from
+    bootstrap estimates (V_{t+1} - V_t), which provides weak learning signal.
+    By using λ-return, the chunk reward is propagated to all steps.
+
+    The TD(λ) return at step t is:
+        G_t = (1-λ) * V_{t+1} + λ * G_{t+1}   (for t < T-1)
+        G_{T-1} = R_chunk                      (terminal step)
+
+    The advantage at step t is:
+        A_t = G_t - V_t
+
+    Args:
+        rewards (torch.Tensor): Chunk-level rewards. Shape: [B] or [B, 1]
+        stepwise_values (torch.Tensor): Per-step value estimates. Shape: [B, num_denoise_steps]
+        num_denoise_steps (int): Number of denoising steps.
+        gamma (float): Discount factor for denoising MDP (typically 1.0).
+        gae_lambda (float): Lambda for TD(λ) return. 1.0 = MC return (all steps get
+            the same chunk reward), 0.0 = TD(0) (only last step uses chunk reward).
+            Default 0.95 provides good balance.
+        normalize_advantages (bool): Whether to normalize advantages.
+        loss_mask (torch.Tensor, optional): Mask for valid samples. Shape: [B] or [B, num_denoise_steps]
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - advantages: Shape [B, num_denoise_steps]
+            - returns: Shape [B, num_denoise_steps]
+    """
+    # Handle reward shape
+    if rewards.dim() == 1:
+        rewards = rewards.unsqueeze(-1)  # [B] -> [B, 1]
+
+    B, T = stepwise_values.shape
+    device = stepwise_values.device
+    dtype = stepwise_values.dtype
+
+    advantages = torch.zeros(B, T, dtype=dtype, device=device)
+    returns = torch.zeros(B, T, dtype=dtype, device=device)
+
+    # Squeeze chunk reward: [B, 1] -> [B]
+    chunk_reward = rewards.squeeze(-1)
+
+    # ========== λ-return backward propagation ==========
+    # This propagates the chunk reward signal to ALL denoising steps,
+    # not just the last one. This is critical for learning.
+
+    # Last step: directly uses chunk reward
+    returns[:, -1] = chunk_reward
+    advantages[:, -1] = chunk_reward - stepwise_values[:, -1]
+
+    # Backward pass: propagate reward signal through λ-return
+    for t in reversed(range(T - 1)):
+        # TD(λ) return: G_t = γ * [(1-λ) * V_{t+1} + λ * G_{t+1}]
+        # When λ=1: G_t = γ * G_{t+1} (pure MC, all steps get chunk_reward)
+        # When λ=0: G_t = γ * V_{t+1} (pure TD(0), intermediate steps bootstrap)
+        # When γ=1 (typical for denoising MDP): G_t = (1-λ)*V_{t+1} + λ*G_{t+1}
+        returns[:, t] = gamma * (
+            (1 - gae_lambda) * stepwise_values[:, t + 1]
+            + gae_lambda * returns[:, t + 1]
+        )
+        advantages[:, t] = returns[:, t] - stepwise_values[:, t]
+
+    # Handle loss mask
+    if loss_mask is not None:
+        if loss_mask.dim() == 1:
+            loss_mask = loss_mask.unsqueeze(-1).expand(-1, T)  # [B] -> [B, T]
+
+    # Normalize advantages
+    if normalize_advantages:
+        if loss_mask is not None:
+            valid_adv = advantages[loss_mask.bool()]
+        else:
+            valid_adv = advantages.flatten()
+
+        if valid_adv.numel() > 0:
+            adv_mean = valid_adv.mean()
+            adv_std = valid_adv.std().clamp(min=1e-8)
+            advantages = (advantages - adv_mean) / adv_std
+
+    return advantages, returns
+

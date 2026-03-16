@@ -699,6 +699,10 @@ class EnvWorker(Worker):
                     self.env_list[i], RecordVideo
                 ):
                     self.env_list[i].flush_video()
+                    # Wait for video writing to complete
+                    for future in self.env_list[i]._save_futures:
+                        future.result()
+                    self.env_list[i]._save_futures = []
                 self.env_list[i].update_reset_state_ids()
         elif mode == "eval":
             for i in range(self.stage_num):
@@ -706,6 +710,10 @@ class EnvWorker(Worker):
                     self.eval_env_list[i], RecordVideo
                 ):
                     self.eval_env_list[i].flush_video()
+                    # Wait for video writing to complete
+                    for future in self.eval_env_list[i]._save_futures:
+                        future.result()
+                    self.eval_env_list[i]._save_futures = []
                 if not self.cfg.env.eval.auto_reset:
                     self.eval_env_list[i].update_reset_state_ids()
 

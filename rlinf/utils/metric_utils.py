@@ -173,6 +173,25 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
         }
         rollout_metrics.update(returns_metrics)
 
+    # Add outer_returns metrics for hierarchical GAE debugging
+    if data_buffer.get("outer_returns", None) is not None:
+        outer_returns = data_buffer["outer_returns"]
+        mean_outer_ret = torch.mean(outer_returns).to(
+            Worker.torch_platform.current_device()
+        )
+        torch.distributed.all_reduce(mean_outer_ret, op=torch.distributed.ReduceOp.AVG)
+
+        # Count non-zero returns (should be > 0 after fix)
+        nonzero_ratio = (outer_returns.abs() > 1e-6).float().mean()
+        nonzero_ratio = nonzero_ratio.to(Worker.torch_platform.current_device())
+        torch.distributed.all_reduce(nonzero_ratio, op=torch.distributed.ReduceOp.AVG)
+
+        outer_returns_metrics = {
+            "outer_returns_mean": mean_outer_ret.item(),
+            "outer_returns_nonzero_ratio": nonzero_ratio.item(),
+        }
+        rollout_metrics.update(outer_returns_metrics)
+
     return rollout_metrics
 
 

@@ -459,3 +459,173 @@ def compute_grpo_actor_loss_fn(**kwargs) -> tuple[torch.Tensor, dict]:
     metrics_data.update(actor_metrics_data)
 
     return actor_loss, metrics_data
+
+
+def compute_stepwise_ppo_actor_loss(
+    stepwise_logprobs: torch.Tensor,
+    stepwise_old_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    clip_ratio_low: float = 0.2,
+    clip_ratio_high: float = 0.2,
+    loss_mask: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Compute Step-wise PPO Actor Loss for Trace-VLA.
+
+    This implements PPO clipping at the denoising step level:
+        L_actor = E_t[min(ratio_t * A_t, clip(ratio_t, 1-eps, 1+eps) * A_t)]
+
+    where ratio_t = pi_theta(x_{t-1}|x_t) / pi_old(x_{t-1}|x_t)
+
+    Args:
+        stepwise_logprobs (torch.Tensor): Current logprobs. Shape: [B, T, action_chunk, action_dim]
+        stepwise_old_logprobs (torch.Tensor): Old logprobs. Shape: [B, T, action_chunk, action_dim]
+        advantages (torch.Tensor): Step-level advantages. Shape: [B, T]
+        clip_ratio_low (float): Lower clipping bound.
+        clip_ratio_high (float): Upper clipping bound.
+        loss_mask (torch.Tensor, optional): Mask for valid samples. Shape: [B] or [B, T]
+
+    Returns:
+        Tuple[torch.Tensor, Dict]: (actor_loss, metrics_dict)
+    """
+    # Sum logprobs over action dimensions to get joint probability
+    # [B, T, action_chunk, action_dim] -> [B, T]
+    if stepwise_logprobs.dim() == 4:
+        logprobs_sum = stepwise_logprobs.sum(dim=(-1, -2))
+        old_logprobs_sum = stepwise_old_logprobs.sum(dim=(-1, -2))
+    elif stepwise_logprobs.dim() == 3:
+        logprobs_sum = stepwise_logprobs.sum(dim=-1)
+        old_logprobs_sum = stepwise_old_logprobs.sum(dim=-1)
+    else:
+        logprobs_sum = stepwise_logprobs
+        old_logprobs_sum = stepwise_old_logprobs
+
+    # Compute log ratio with numerical stability
+    log_ratio = logprobs_sum - old_logprobs_sum
+    log_ratio = log_ratio.clamp(min=-10.0, max=10.0)
+    ratio = torch.exp(log_ratio)
+
+    # PPO Clipping
+    clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high)
+
+    # Policy loss (negative because we maximize)
+    policy_loss1 = -advantages * ratio
+    policy_loss2 = -advantages * clipped_ratio
+    policy_loss = torch.max(policy_loss1, policy_loss2)
+
+    # Handle loss mask
+    if loss_mask is not None:
+        if loss_mask.dim() == 1:
+            loss_mask = loss_mask.unsqueeze(-1).expand_as(policy_loss)
+        policy_loss = (policy_loss * loss_mask).sum() / loss_mask.sum().clamp(min=1)
+    else:
+        policy_loss = policy_loss.mean()
+
+    # Compute metrics
+    with torch.no_grad():
+        approx_kl = log_ratio.mean()
+        clip_fraction = ((policy_loss1 < policy_loss2).float()).mean()
+        ratio_mean = ratio.mean()
+
+    metrics = {
+        "actor/stepwise_policy_loss": policy_loss.detach(),
+        "actor/stepwise_approx_kl": approx_kl.detach(),
+        "actor/stepwise_clip_fraction": clip_fraction.detach(),
+        "actor/stepwise_ratio": ratio_mean.detach(),
+    }
+
+    return policy_loss, metrics
+
+
+def compute_stepwise_critic_loss(
+    stepwise_values: torch.Tensor,
+    returns: torch.Tensor,
+    stepwise_prev_values: torch.Tensor,
+    value_clip: float = 0.2,
+    huber_delta: float = 10.0,
+    loss_mask: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Compute Step-wise Critic Loss for Trace-VLA.
+
+    This implements value clipping at the denoising step level:
+        L_value = E_t[(V_phi(x_hat_{0|t}, t) - R_chunk)^2]
+
+    Note: All denoising steps share the same target (chunk-level reward).
+
+    Args:
+        stepwise_values (torch.Tensor): Current value predictions. Shape: [B, T]
+        returns (torch.Tensor): Target values (chunk reward broadcast). Shape: [B, T]
+        stepwise_prev_values (torch.Tensor): Old value predictions. Shape: [B, T]
+        value_clip (float): Value clipping threshold.
+        huber_delta (float): Huber loss delta parameter.
+        loss_mask (torch.Tensor, optional): Mask for valid samples. Shape: [B] or [B, T]
+
+    Returns:
+        Tuple[torch.Tensor, Dict]: (critic_loss, metrics_dict)
+    """
+    # Value clipping (PPO style)
+    value_pred_clipped = stepwise_prev_values + (
+        stepwise_values - stepwise_prev_values
+    ).clamp(-value_clip, value_clip)
+
+    # Huber Loss
+    value_loss_original = huber_loss(returns - stepwise_values, huber_delta)
+    value_loss_clipped = huber_loss(returns - value_pred_clipped, huber_delta)
+    value_loss = torch.max(value_loss_original, value_loss_clipped)
+
+    # Average over all denoising steps
+    if loss_mask is not None:
+        if loss_mask.dim() == 1:
+            loss_mask = loss_mask.unsqueeze(-1).expand_as(value_loss)
+        value_loss = (value_loss * loss_mask).sum() / loss_mask.sum().clamp(min=1)
+    else:
+        value_loss = value_loss.mean()
+
+    # Compute metrics
+    with torch.no_grad():
+        returns_var = returns.var().clamp(min=1e-8)
+        residual_var = (returns - stepwise_values).var()
+        explained_var = 1 - residual_var / returns_var
+
+    metrics = {
+        "critic/stepwise_value_loss": value_loss.detach(),
+        "critic/stepwise_explained_variance": explained_var.detach(),
+    }
+
+    return value_loss, metrics
+
+
+@register_policy_loss("stepwise_actor_critic")
+def compute_stepwise_actor_critic_loss(**kwargs) -> tuple[torch.Tensor, dict]:
+    """
+    Compute Step-wise PPO Actor+Critic Loss for Trace-VLA.
+
+    This is the core loss function for Trace-VLA that computes both actor
+    and critic losses at the denoising step level.
+
+    Expected kwargs:
+        - stepwise_logprobs: [B, T, action_chunk, action_dim]
+        - stepwise_old_logprobs: [B, T, action_chunk, action_dim]
+        - stepwise_values: [B, T]
+        - stepwise_prev_values: [B, T]
+        - advantages: [B, T]
+        - returns: [B, T]
+        - clip_ratio_low, clip_ratio_high, value_clip, huber_delta
+        - loss_mask: [B] or [B, T]
+
+    Returns:
+        Tuple[torch.Tensor, Dict]: (total_loss, metrics_dict)
+    """
+    actor_loss, actor_metrics = compute_stepwise_ppo_actor_loss(**kwargs)
+    critic_loss, critic_metrics = compute_stepwise_critic_loss(**kwargs)
+
+    total_loss = actor_loss + critic_loss
+
+    metrics = {**actor_metrics, **critic_metrics}
+    metrics["loss/stepwise_total"] = total_loss.detach()
+
+    return total_loss, metrics
+

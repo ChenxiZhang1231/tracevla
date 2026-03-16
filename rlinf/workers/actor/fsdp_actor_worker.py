@@ -1215,6 +1215,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         Compute the advantages and returns.
         """
+        # Check if using Trace-VLA stepwise advantages
+        if self.cfg.algorithm.adv_type == "stepwise_gae":
+            return self._compute_stepwise_advantages_and_returns()
+
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
@@ -1236,6 +1240,123 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch.update({"loss_mask": kwargs["loss_mask"]})
         if kwargs["loss_mask_sum"] is not None:
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
+
+        rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        return rollout_metrics
+
+    def _compute_stepwise_advantages_and_returns(self) -> dict[str, torch.Tensor]:
+        """
+        Compute Trace-VLA stepwise advantages with two-level hierarchical GAE.
+
+        Level 1 (Outer): Compute chunk-level GAE to propagate episode reward
+                         backwards across all chunks
+        Level 2 (Inner): Compute step-level GAE within each chunk using
+                         chunk returns as targets
+
+        This fixes the critical bug where sparse rewards [0, 0, ..., 0, 1]
+        were directly passed to stepwise GAE, causing 93.75% of training
+        samples to have zero learning targets.
+        """
+        from rlinf.algorithms.advantages import (
+            compute_gae_advantages_and_returns,
+            compute_stepwise_gae_advantages,
+        )
+
+        # Get stepwise values: [T, B, num_denoise_steps]
+        stepwise_values = self.rollout_batch.get("stepwise_values")
+        if stepwise_values is None:
+            raise ValueError(
+                "stepwise_values not found in rollout_batch. "
+                "Make sure use_tracevla_value=True in model config."
+            )
+
+        # Get rewards: [T, B, num_action_chunks] for chunk_level reward
+        rewards = self.rollout_batch["rewards"]
+        # Get dones: [T+1, B, num_action_chunks]
+        dones = self.rollout_batch["dones"]
+
+        T, B = rewards.shape[:2]
+        num_denoise_steps = stepwise_values.shape[-1]
+
+        # ========== Level 1: Outer Chunk-level GAE ==========
+        # Sum rewards across action chunks for chunk-level reward
+        if self.cfg.algorithm.reward_type == "chunk_level":
+            chunk_rewards = rewards.sum(dim=-1)  # [T, B]
+            chunk_dones = dones.max(dim=-1)[0]  # [T+1, B]
+        else:
+            chunk_rewards = rewards[..., 0]  # [T, B]
+            chunk_dones = dones[..., 0]  # [T+1, B]
+
+        # Create chunk-level values from mean of stepwise values
+        # Shape: [T, B, num_denoise_steps] -> [T, B]
+        chunk_values = stepwise_values.mean(dim=-1)  # Mean over denoise steps
+
+        # Append bootstrap value V(T+1) for GAE computation
+        # For truncated episodes, bootstrap is already added to rewards in rollout
+        # For terminated episodes, V(T+1) = 0
+        bootstrap_value = torch.zeros(
+            1, B, device=chunk_values.device, dtype=chunk_values.dtype
+        )
+        chunk_values_with_bootstrap = torch.cat(
+            [chunk_values, bootstrap_value], dim=0
+        )  # [T+1, B]
+
+        # Compute outer GAE (chunk-to-chunk reward propagation)
+        # This propagates sparse terminal reward to all chunks!
+        outer_advantages, outer_returns = compute_gae_advantages_and_returns(
+            rewards=chunk_rewards,  # [T, B]
+            values=chunk_values_with_bootstrap,  # [T+1, B]
+            dones=chunk_dones,  # [T+1, B]
+            gamma=self.cfg.algorithm.get("gamma", 1.0),
+            gae_lambda=self.cfg.algorithm.get("gae_lambda", 0.95),
+            normalize_advantages=False,  # Don't normalize here, do it in inner GAE
+        )  # outer_returns: [T, B] - chunk-level bootstrapped returns
+
+        # ========== Level 2: Inner Step-level GAE ==========
+        # Use outer_returns (not raw rewards!) as targets for stepwise advantage
+        # This ensures all chunks have non-zero learning targets
+        flat_chunk_returns = outer_returns.reshape(-1)  # [T*B]
+        flat_stepwise_values = stepwise_values.reshape(
+            -1, num_denoise_steps
+        )  # [T*B, num_denoise_steps]
+
+        # Get loss mask if available
+        loss_mask = self.rollout_batch.get("loss_mask", None)
+        if loss_mask is not None:
+            if self.cfg.algorithm.reward_type == "chunk_level":
+                flat_loss_mask = loss_mask.any(dim=-1).reshape(-1)  # [T*B]
+            else:
+                flat_loss_mask = loss_mask[..., 0].reshape(-1)
+        else:
+            flat_loss_mask = None
+
+        stepwise_advantages, stepwise_returns = compute_stepwise_gae_advantages(
+            rewards=flat_chunk_returns,  # NOW uses propagated returns!
+            stepwise_values=flat_stepwise_values,
+            num_denoise_steps=num_denoise_steps,
+            gamma=self.cfg.algorithm.get("gamma", 1.0),
+            gae_lambda=self.cfg.algorithm.get("gae_lambda", 0.95),
+            normalize_advantages=self.cfg.algorithm.normalize_advantages,
+            loss_mask=flat_loss_mask,
+        )
+
+        # Reshape back to [T, B, num_denoise_steps]
+        stepwise_advantages = stepwise_advantages.reshape(T, B, num_denoise_steps)
+        stepwise_returns = stepwise_returns.reshape(T, B, num_denoise_steps)
+
+        # Store in rollout_batch
+        self.rollout_batch["stepwise_advantages"] = stepwise_advantages
+        self.rollout_batch["stepwise_returns"] = stepwise_returns
+
+        # Also compute chunk-level advantages for compatibility
+        chunk_advantages = stepwise_advantages.mean(dim=-1, keepdim=True)  # [T, B, 1]
+        self.rollout_batch["advantages"] = chunk_advantages
+
+        # Store outer returns for debugging/metrics
+        self.rollout_batch["outer_returns"] = outer_returns  # [T, B]
+
+        if loss_mask is not None:
+            self.rollout_batch["loss_mask"] = loss_mask
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
         return rollout_metrics
@@ -1429,7 +1550,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         kwargs["prev_logprobs"] = prev_logprobs
 
                     compute_values = (
-                        True if self.cfg.algorithm.adv_type == "gae" else False
+                        True if self.cfg.algorithm.adv_type in ["gae", "stepwise_gae"] else False
                     )
 
                     with self.amp_context:
@@ -1448,29 +1569,60 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     ):
                         prev_logprobs = output_dict["prev_logprobs"]
 
-                    kwargs = {
-                        "loss_type": self.cfg.algorithm.loss_type,
-                        "logprob_type": self.cfg.algorithm.logprob_type,
-                        "reward_type": self.cfg.algorithm.reward_type,
-                        "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
-                        "logprobs": output_dict["logprobs"],
-                        "values": output_dict.get("values", None),
-                        "old_logprobs": prev_logprobs,
-                        "advantages": advantages,
-                        "returns": returns,
-                        "prev_values": prev_values,
-                        "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
-                        "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
-                        "value_clip": self.cfg.algorithm.get("value_clip", None),
-                        "huber_delta": self.cfg.algorithm.get("huber_delta", None),
-                        "loss_mask": loss_mask,
-                        "loss_mask_sum": loss_mask_sum,
-                        "max_episode_steps": self.cfg.env.train.max_episode_steps,
-                        "task_type": self.cfg.runner.task_type,
-                        "critic_warmup": self.optimizer_steps
-                        < self.critic_warmup_steps,
-                    }
-                    loss, metrics_data = policy_loss(**kwargs)
+                    # ========== Trace-VLA: Handle stepwise loss ==========
+                    if self.cfg.algorithm.loss_type == "stepwise_actor_critic":
+                        # Get stepwise data from batch (old values from rollout)
+                        stepwise_old_logprobs = batch.get("stepwise_logprobs")
+                        stepwise_prev_values = batch.get("stepwise_values")
+                        stepwise_advantages = batch.get("stepwise_advantages")
+                        stepwise_returns = batch.get("stepwise_returns")
+
+                        # Get recomputed stepwise data from model forward
+                        new_stepwise_logprobs = output_dict.get("stepwise_logprobs", stepwise_old_logprobs)
+                        new_stepwise_values = output_dict.get("stepwise_values", stepwise_prev_values)
+
+                        kwargs = {
+                            "loss_type": self.cfg.algorithm.loss_type,
+                            "stepwise_logprobs": new_stepwise_logprobs,
+                            "stepwise_old_logprobs": stepwise_old_logprobs,
+                            "stepwise_values": new_stepwise_values,
+                            "stepwise_prev_values": stepwise_prev_values,
+                            "advantages": stepwise_advantages,
+                            "returns": stepwise_returns,
+                            "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+                            "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                            "value_clip": self.cfg.algorithm.get("value_clip", None),
+                            "huber_delta": self.cfg.algorithm.get("huber_delta", None),
+                            "loss_mask": loss_mask,
+                            "task_type": self.cfg.runner.task_type,
+                            "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,
+                        }
+                        loss, metrics_data = policy_loss(**kwargs)
+                    else:
+                        # Original loss computation
+                        kwargs = {
+                            "loss_type": self.cfg.algorithm.loss_type,
+                            "logprob_type": self.cfg.algorithm.logprob_type,
+                            "reward_type": self.cfg.algorithm.reward_type,
+                            "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
+                            "logprobs": output_dict["logprobs"],
+                            "values": output_dict.get("values", None),
+                            "old_logprobs": prev_logprobs,
+                            "advantages": advantages,
+                            "returns": returns,
+                            "prev_values": prev_values,
+                            "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+                            "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                            "value_clip": self.cfg.algorithm.get("value_clip", None),
+                            "huber_delta": self.cfg.algorithm.get("huber_delta", None),
+                            "loss_mask": loss_mask,
+                            "loss_mask_sum": loss_mask_sum,
+                            "max_episode_steps": self.cfg.env.train.max_episode_steps,
+                            "task_type": self.cfg.runner.task_type,
+                            "critic_warmup": self.optimizer_steps
+                            < self.critic_warmup_steps,
+                        }
+                        loss, metrics_data = policy_loss(**kwargs)
 
                     entropy_loss = torch.tensor(
                         0.0, device=Worker.torch_platform.current_device()

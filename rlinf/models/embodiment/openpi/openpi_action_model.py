@@ -66,6 +66,10 @@ class OpenPi0Config(Pi0Config):
     value_after_vlm: bool = False  # value after vlm, pi05 mode
     value_vlm_mode: str = "mean_token"  # last_token, mean_token, first_token
 
+    # ===== Trace-VLA parameters =====
+    use_tracevla_value: bool = False  # Use Tweedie x0_pred for value head input
+    x0_value_embed_dim: int = 256     # Embedding dimension for x0_pred projection
+
     # ===== DSRL-specific parameters =====
     use_dsrl: bool = False  # Enable DSRL algorithm
     dsrl_state_dim: int = 8  # Raw state dimension for DSRL encoders
@@ -151,13 +155,39 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             else:
                 value_head_hidden_sizes = (512, 256, 128)
             value_head_activation = "relu"
-            self.value_head = ValueHead(
-                input_dim=proj_width,
-                hidden_sizes=value_head_hidden_sizes,
-                output_dim=1,
-                activation=value_head_activation,
-                bias_last=True,
-            )
+
+            # Trace-VLA: Add x0_value_proj for Tweedie's formula
+            if self.config.use_tracevla_value:
+                import torch.nn as nn
+                # Use bfloat16 to match the backbone dtype (loaded from checkpoint later)
+                # This ensures all parameters share a single dtype for FSDP
+                _tracevla_dtype = torch.bfloat16
+                # Project flattened x0_pred to embedding space
+                x0_flat_dim = self.config.action_horizon * self.config.action_dim
+                self.x0_value_proj = nn.Linear(
+                    x0_flat_dim,
+                    self.config.x0_value_embed_dim,
+                    bias=True
+                ).to(dtype=_tracevla_dtype)
+                # Value head input: suffix_out_mean + x0_embed
+                value_head_input_dim = proj_width + self.config.x0_value_embed_dim
+                # Value head with new input dim also needs bfloat16
+                self.value_head = ValueHead(
+                    input_dim=value_head_input_dim,
+                    hidden_sizes=value_head_hidden_sizes,
+                    output_dim=1,
+                    activation=value_head_activation,
+                    bias_last=True,
+                ).to(dtype=_tracevla_dtype)
+            else:
+                value_head_input_dim = proj_width
+                self.value_head = ValueHead(
+                    input_dim=value_head_input_dim,
+                    hidden_sizes=value_head_hidden_sizes,
+                    output_dim=1,
+                    activation=value_head_activation,
+                    bias_last=True,
+                )
         self.use_vlm_value = getattr(self.config, "value_after_vlm", False) and getattr(
             self.config, "add_value_head", False
         )
@@ -405,23 +435,46 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             denoise_inds,
             compute_values,
         )
-        log_probs = log_probs[
+        # Slice to action chunk and env dim: [B, num_steps(+1), action_chunk, action_env_dim]
+        log_probs_sliced = log_probs[
             :, :, : self.config.action_chunk, : self.config.action_env_dim
         ]
         entropy = entropy[
             :, :, : self.config.action_chunk, : self.config.action_env_dim
         ]
-        # post process
-        log_probs = log_probs.mean(dim=1)
+        # post process - average over steps for compatibility
+        log_probs_avg = log_probs_sliced.mean(dim=1)
         entropy = entropy.mean(dim=[1, 2, 3], keepdim=False)[
             :, None
         ]  # [:,None] to align with loss-mask shape
-        value_t = value_t.mean(dim=-1, keepdim=False)
-        return {
-            "logprobs": log_probs,
-            "values": value_t,
-            "entropy": entropy,
-        }
+
+        # ========== Trace-VLA: Return stepwise values and logprobs ==========
+        if self.config.use_tracevla_value:
+            # value_t has shape [B, num_steps] from get_log_prob_value
+            # log_probs_sliced has shape [B, num_steps+1, action_chunk, action_env_dim] when joint_logprob=True
+            # We need to exclude the initial logprob to align with values
+            # The initial logprob is at index 0, so we skip it: log_probs_sliced[:, 1:, ...]
+            if self.config.joint_logprob:
+                stepwise_logprobs = log_probs_sliced[:, 1:, :, :]  # Skip initial, shape [B, num_steps, ...]
+            else:
+                stepwise_logprobs = log_probs_sliced  # Already has correct shape [B, num_steps, ...]
+
+            # Return both averaged (for compatibility) and stepwise data
+            return {
+                "logprobs": log_probs_avg,
+                "values": value_t.mean(dim=-1, keepdim=False),  # [B] for compatibility
+                "stepwise_logprobs": stepwise_logprobs,  # [B, num_steps, action_chunk, action_env_dim]
+                "stepwise_values": value_t,  # [B, num_steps] for stepwise loss
+                "entropy": entropy,
+            }
+        else:
+            # Original behavior: average over steps
+            value_t = value_t.mean(dim=-1, keepdim=False)
+            return {
+                "logprobs": log_probs_avg,
+                "values": value_t,
+                "entropy": entropy,
+            }
 
     def forward_nft(
         self,
@@ -607,6 +660,15 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "prev_values": prev_values,
             "forward_inputs": forward_inputs,
         }
+
+        # ========== Trace-VLA: Pass stepwise data to result ==========
+        if "stepwise_logprobs" in outputs:
+            result["stepwise_logprobs"] = outputs["stepwise_logprobs"]
+        if "stepwise_values" in outputs:
+            result["stepwise_values"] = outputs["stepwise_values"]
+        if "stepwise_x0_pred" in outputs:
+            result["stepwise_x0_pred"] = outputs["stepwise_x0_pred"]
+
         return actions, result
 
     @torch.no_grad()
@@ -643,6 +705,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         values = []
         chains.append(x_t)
 
+        # ========== Trace-VLA: Collect stepwise data ==========
+        collect_stepwise = self.config.use_tracevla_value and mode == "train"
+        stepwise_logprobs = [] if collect_stepwise else None
+        stepwise_values = [] if collect_stepwise else None
+        stepwise_x0_pred = [] if collect_stepwise else None
+
         # add value based on the vlm for pi05, expert for pi0
         if self.use_vlm_value:
             values_vlm = self.get_value_from_vlm(prefix_output)
@@ -651,6 +719,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 x_t, torch.zeros_like(noise), torch.ones_like(noise)
             )
             log_probs.append(initial_log_prob)
+            # NOTE: Do NOT add initial_log_prob to stepwise_logprobs
+            # because there's no corresponding stepwise_value for it.
+            # stepwise data should only contain the loop iterations.
 
         # In the joint logprob mode, we need to sample the logprob for each denoise step
         # In the non-joint logprob mode, only one denoise step is sampled and ode-sde mix sampling is used
@@ -686,18 +757,35 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             if idx == denoise_inds[0][idx]:
                 sample_method = self.config.noise_method
             else:
-                sample_method = "flow_ode"
-            x_t_prev = x_t
-            x_t_mean, x_t_std, value_t, v_t = self.sample_mean_var_val(
-                x_t,
-                idx,
-                state,
-                prefix_pad_masks,
-                past_key_values,
-                sample_method,
-                num_steps,
-                compute_values,
-            )
+                sample_mode = "eval"
+
+            # Trace-VLA: Get x0_pred when collecting stepwise data
+            if collect_stepwise:
+                x_t_mean, x_t_std, value_t, x0_pred_step = self.sample_mean_var_val(
+                    x_t,
+                    idx,
+                    state,
+                    prefix_pad_masks,
+                    past_key_values,
+                    sample_mode,
+                    num_steps,
+                    compute_values,
+                    return_x0_pred=True,
+                )
+                stepwise_values.append(value_t)
+                stepwise_x0_pred.append(x0_pred_step)
+            else:
+                x_t_mean, x_t_std, value_t = self.sample_mean_var_val(
+                    x_t,
+                    idx,
+                    state,
+                    prefix_pad_masks,
+                    past_key_values,
+                    sample_mode,
+                    num_steps,
+                    compute_values,
+                )
+
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t_mean + self.sample_noise(x_t.shape, device) * x_t_std
             if collect_nft_traces:
@@ -720,6 +808,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             values.append(value_t)
             chains.append(x_t)
             log_probs.append(log_prob)
+
+            # Trace-VLA: Store per-step logprob
+            if collect_stepwise:
+                stepwise_logprobs.append(log_prob)
+
         x_0 = x_t
         chains = torch.stack(chains, dim=1)
         # post process for logprob
@@ -738,6 +831,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             values = values_vlm[:, None]
         else:
             values = torch.stack(values, dim=1).mean(dim=-1, keepdim=True)
+
+
         result = {
             "actions": x_0,
             "chains": chains,
@@ -757,6 +852,24 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             )
         return result
 
+        # ========== Trace-VLA: Add stepwise data to result ==========
+        if collect_stepwise:
+            # Stack stepwise data: [num_steps, B, ...] -> [B, num_steps, ...]
+            result["stepwise_logprobs"] = torch.stack(stepwise_logprobs, dim=1)[
+                :, :, : self.config.action_chunk, : self.config.action_env_dim
+            ]  # [B, num_steps, action_chunk, action_dim]
+            result["stepwise_values"] = torch.stack(stepwise_values, dim=1)  # [B, num_steps]
+            result["stepwise_x0_pred"] = torch.stack(stepwise_x0_pred, dim=1)  # [B, num_steps, action_horizon, action_dim]
+
+            # Debug: Assert shapes match
+            assert result["stepwise_logprobs"].shape[1] == result["stepwise_values"].shape[1], (
+                f"Shape mismatch! stepwise_logprobs: {result['stepwise_logprobs'].shape}, "
+                f"stepwise_values: {result['stepwise_values'].shape}, "
+                f"num_steps: {num_steps}, config.num_steps: {self.config.num_steps}"
+            )
+
+        return result
+
     def sample_mean_var_val(
         self,
         x_t,
@@ -767,12 +880,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         sample_method,
         denoise_steps,
         compute_values=True,
+        return_x0_pred=False,
     ):
         """
         Sample the mean, variance and value of the action at a given timestep.
-        Rollout sample (idx is int) and actor get_log_prob_value (idx is tensor)
-        will load this function. `sample_method` is one of flow_ode/flow_sde/
-        flow_cps/flow_noise.
+        Rollout sample (idx is int) and actor get_log_prob_value (idx is tensor) will load this function.
+
+        Args:
+            return_x0_pred: If True, also return the Tweedie clean prediction x0_pred.
         """
         # expand the shape
         bsize = state.shape[0]
@@ -790,19 +905,67 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         v_t, suffix_out = self.get_velocity(
             state, x_t, t_input, prefix_pad_masks, past_key_values
         )
+        v_t = self.action_out_proj(suffix_out)  # [bs,n_action_steps,max_action_dim]
+
+        # ========== Trace-VLA: Compute Tweedie clean prediction ==========
+        # x0_pred = x_t - v_t * t  (Tweedie's formula for flow matching)
+        t_input_expanded = t_input[:, None, None].expand_as(x_t)
+        x0_pred = x_t - v_t * t_input_expanded
+
         # value prediction
         if (
             self.config.add_value_head
             and compute_values
             and not self.config.value_after_vlm
         ):
-            value_t = self._compute_value_from_suffix(suffix_out)
+            # Trace-VLA: Use Tweedie x0_pred for value input
+            if self.config.use_tracevla_value:
+                # Step 1: Get suffix_out mean for context
+                if self.config.chunk_critic_input:
+                    suffix_out_value = torch.mean(
+                        suffix_out[:, : self.config.action_chunk], dim=1, keepdim=False
+                    )
+                else:
+                    suffix_out_value = torch.mean(suffix_out, dim=1, keepdim=False)
+
+                # Step 2: CRITICAL - Detach x0_pred to prevent value loss from
+                # flowing back to action_out_proj and destroying the policy
+                x0_pred_detached = x0_pred.detach()
+
+                # Step 3: Flatten and project x0_pred
+                x0_flat = x0_pred_detached.view(bsize, -1)  # [B, action_horizon * action_dim]
+                # Match dtype to x0_value_proj's dtype
+                x0_proj_dtype = next(self.x0_value_proj.parameters()).dtype
+                x0_flat = x0_flat.to(dtype=x0_proj_dtype)
+                x0_embed = self.x0_value_proj(x0_flat)  # [B, x0_value_embed_dim]
+
+                # Step 4: Concatenate suffix_out and x0_embed
+                if self.config.detach_critic_input:
+                    suffix_out_value = suffix_out_value.detach()
+                # Ensure suffix_out_value has same dtype as x0_embed for concatenation
+                suffix_out_value = suffix_out_value.to(dtype=x0_proj_dtype)
+                value_input = torch.cat([suffix_out_value, x0_embed], dim=-1)
+
+                # Step 5: Compute value
+                value_t = self.value_head(value_input)[:, 0]
+            else:
+                # Original value computation
+                if self.config.chunk_critic_input:
+                    suffix_out_value = torch.mean(
+                        suffix_out[:, : self.config.action_chunk], dim=1, keepdim=False
+                    )
+                else:
+                    suffix_out_value = torch.mean(suffix_out, dim=1, keepdim=False)
+                # detach critic input
+                if self.config.detach_critic_input:
+                    suffix_out_value = suffix_out_value.detach()
+                value_t = self.value_head(suffix_out_value)[:, 0]
         else:
             value_t = torch.zeros((bsize), device=device)
-        # sample mean and variance
+
+        # ode sde mix sampling
         delta = delta[:, None, None].expand_as(x_t)
         t_input = t_input[:, None, None].expand_as(x_t)
-        x0_pred = x_t - v_t * t_input
         x1_pred = x_t + v_t * (1 - t_input)
 
         if sample_method == "flow_ode":
@@ -831,7 +994,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         else:
             raise ValueError(f"Invalid noise method: {sample_method}")
         x_t_mean = x0_pred * x0_weight + x1_pred * x1_weight
-        return x_t_mean, x_t_std, value_t, v_t
+
+        if return_x0_pred:
+            return x_t_mean, x_t_std, value_t, x0_pred
+        return x_t_mean, x_t_std, value_t
 
     def get_suffix_out(
         self,
@@ -1026,7 +1192,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             prefix_mask = [True] * 1 + [False] * (all_token_length - 1)
         prefix_out_value = prefix_output[:, prefix_mask, :]
         prefix_out_value = prefix_out_value.mean(dim=1, keepdim=False)
-        prefix_out_value = prefix_out_value.to(dtype=torch.float32)
+        # Match input dtype to value_head's dtype
+        value_head_dtype = next(self.value_head.parameters()).dtype
+        prefix_out_value = prefix_out_value.to(dtype=value_head_dtype)
         values_vlm = self.value_head(prefix_out_value)[:, 0]
         return values_vlm
 

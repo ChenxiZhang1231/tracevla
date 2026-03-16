@@ -421,7 +421,13 @@ class MultiStepRolloutWorker(Worker):
                         result["prev_logprobs"],
                         float(self.version),
                         dtype=torch.float32,
-                    ),
+                    )
+                    if self.collect_versions
+                    else None,
+                    # Trace-VLA stepwise data
+                    stepwise_logprobs=result.get("stepwise_logprobs"),
+                    stepwise_values=result.get("stepwise_values"),
+                    stepwise_x0_pred=result.get("stepwise_x0_pred"),
                 )
                 self.send_rollout_result(output_channel, rollout_result, mode="train")
         for _ in range(self.num_pipeline_stages):

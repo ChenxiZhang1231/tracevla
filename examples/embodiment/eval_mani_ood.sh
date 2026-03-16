@@ -7,11 +7,12 @@ export SRC_FILE="${EMBODIED_PATH}/eval_embodied_agent.py"
 
 export HYDRA_FULL_ERROR=1
 
-EVAL_NAME=YOUR_EVAL_NAME
-CKPT_PATH=YOUR_CKPT_PATH           # Optional: .pt file or None, if None, will use the checkpoint in rollout.model.model_path
-CONFIG_NAME=YOUR_CFG_NAME          # env.eval must be maniskill_ood_template
-TOTAL_NUM_ENVS=YOUR_TOTAL_NUM_ENVS # total number of evaluation environments
-EVAL_ROLLOUT_EPOCH=YOUR_EVAL_ROLLOUT_EPOCH # eval rollout epoch, total_trajectory_num = eval_rollout_epoch * total_num_envs
+# Accept command line arguments or use defaults
+CONFIG_NAME=${1:-maniskill_ppo_openpi_pi05}  # 第1个参数：配置名
+CKPT_PATH=${2:-null}                          # 第2个参数：检查点路径
+TOTAL_NUM_ENVS=${3:-320}                      # 第3个参数：环境数量
+EVAL_ROLLOUT_EPOCH=${4:-1}                    # 第4个参数：评估轮数
+EVAL_NAME=${5:-${CONFIG_NAME}_eval}           # 第5个参数：实验名称
 
 for env_id in \
     "PutOnPlateInScene25VisionImage-v1" "PutOnPlateInScene25VisionTexture03-v1" "PutOnPlateInScene25VisionTexture05-v1" \
