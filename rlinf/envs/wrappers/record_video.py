@@ -73,10 +73,21 @@ class RecordVideo(gym.Wrapper):
             raise AttributeError("Environment must have 'seed' attribute")
 
         self.video_cfg = video_cfg
-        self.render_images: list[np.ndarray] = []
-        self.video_cnt = 0
         self._num_envs = getattr(env, "num_envs", 1)
-        self._executor = ThreadPoolExecutor(max_workers=1)
+
+        # Check if per_env_video mode is enabled
+        self._per_env_video = getattr(video_cfg, "per_env_video", False)
+
+        if self._per_env_video:
+            # Per-env mode: separate buffer for each environment
+            self.render_images_per_env: list[list[np.ndarray]] = [[] for _ in range(self._num_envs)]
+            self.video_cnt_per_env: list[int] = [0] * self._num_envs
+        else:
+            # Original mode: single tiled buffer
+            self.render_images: list[np.ndarray] = []
+            self.video_cnt = 0
+
+        self._executor = ThreadPoolExecutor(max_workers=4 if self._per_env_video else 1)
         self._save_futures: list[Future] = []
 
         if fps is not None:
@@ -324,12 +335,19 @@ class RecordVideo(gym.Wrapper):
                 )
                 for env_id, img in enumerate(images)
             ]
-        if len(images) > 1:
-            nrows = int(np.sqrt(len(images)))
-            full_image = tile_images(images, nrows=nrows)
-            self.render_images.append(full_image)
+
+        if self._per_env_video:
+            # Per-env mode: store each env's frame separately
+            for env_id, img in enumerate(images):
+                self.render_images_per_env[env_id].append(img)
         else:
-            self.render_images.append(images[0])
+            # Original mode: tile all envs into one frame
+            if len(images) > 1:
+                nrows = int(np.sqrt(len(images)))
+                full_image = tile_images(images, nrows=nrows)
+                self.render_images.append(full_image)
+            else:
+                self.render_images.append(images[0])
 
     def add_new_frames(
         self,
@@ -409,21 +427,41 @@ class RecordVideo(gym.Wrapper):
 
     def flush_video(self, video_sub_dir: Optional[str] = None):
         """Write buffered frames to an MP4 file (async)."""
-        if not self.render_images:
-            return
+        if self._per_env_video:
+            # Per-env mode: save each env's video separately
+            for env_id in range(self._num_envs):
+                if not self.render_images_per_env[env_id]:
+                    continue
 
-        output_dir = os.path.join(
-            self.video_cfg.video_base_dir, f"seed_{self.env.seed}"
-        )
-        if video_sub_dir is not None:
-            output_dir = os.path.join(output_dir, f"{video_sub_dir}")
+                output_dir = os.path.join(
+                    self.video_cfg.video_base_dir, f"seed_{self.env.seed}", f"env_{env_id}"
+                )
+                if video_sub_dir is not None:
+                    output_dir = os.path.join(output_dir, f"{video_sub_dir}")
 
-        os.makedirs(output_dir, exist_ok=True)
-        mp4_path = os.path.join(output_dir, f"{self.video_cnt}.mp4")
-        frames = list(self.render_images)
-        self.render_images = []
-        self.video_cnt += 1
-        self._submit_save(frames, mp4_path)
+                os.makedirs(output_dir, exist_ok=True)
+                mp4_path = os.path.join(output_dir, f"{self.video_cnt_per_env[env_id]}.mp4")
+                frames = list(self.render_images_per_env[env_id])
+                self.render_images_per_env[env_id] = []
+                self.video_cnt_per_env[env_id] += 1
+                self._submit_save(frames, mp4_path)
+        else:
+            # Original mode: save tiled video
+            if not self.render_images:
+                return
+
+            output_dir = os.path.join(
+                self.video_cfg.video_base_dir, f"seed_{self.env.seed}"
+            )
+            if video_sub_dir is not None:
+                output_dir = os.path.join(output_dir, f"{video_sub_dir}")
+
+            os.makedirs(output_dir, exist_ok=True)
+            mp4_path = os.path.join(output_dir, f"{self.video_cnt}.mp4")
+            frames = list(self.render_images)
+            self.render_images = []
+            self.video_cnt += 1
+            self._submit_save(frames, mp4_path)
 
     def _submit_save(self, frames: list[np.ndarray], mp4_path: str) -> None:
         """Submit a background job to save the video."""

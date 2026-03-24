@@ -1238,6 +1238,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.cfg.algorithm.adv_type == "stepwise_gae":
             return self._compute_stepwise_advantages_and_returns()
 
+        # Check if using hierarchical GAE (HUA-RL / FlowRL)
+        if self.cfg.algorithm.adv_type == "hierarchical_gae":
+            return self._compute_hierarchical_advantages_and_returns()
+
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
@@ -1251,7 +1255,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
         }
-
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
 
         self.rollout_batch.update(advantages_and_returns)
@@ -1373,6 +1376,229 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         # Store outer returns for debugging/metrics
         self.rollout_batch["outer_returns"] = outer_returns  # [T, B]
+
+        if loss_mask is not None:
+            self.rollout_batch["loss_mask"] = loss_mask
+
+        rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        return rollout_metrics
+
+    def _compute_hierarchical_advantages_and_returns(self) -> dict[str, torch.Tensor]:
+        """
+        Compute Hierarchical GAE advantages for HUA-RL / FlowRL.
+
+        This implements bi-level advantage estimation:
+        1. Chunk-Level GAE: Standard GAE across chunks for long-term credit assignment
+        2. Step-Level λ-return: Within-chunk credit assignment with chunk-level bootstrap
+
+        The key innovation is that step-level returns bootstrap to the NEXT chunk's
+        value estimate, enabling proper credit propagation across both time scales.
+
+        Returns are stored in rollout_batch:
+            - chunk_advantages: [T, B] - Chunk-level advantages
+            - chunk_returns: [T, B] - Chunk-level returns
+            - step_advantages: [T, B, num_denoise_steps] - Step-level advantages
+            - step_returns: [T, B, num_denoise_steps] - Step-level returns
+            - advantages: [T, B, num_denoise_steps] - Alias for step_advantages (for policy gradient)
+        """
+        from rlinf.algorithms.advantages import compute_hierarchical_gae
+
+        # ===== Check if we should use baseline GAE instead =====
+        step_actor_coef = self.cfg.algorithm.get("step_actor_coef", 1.0)
+        step_value_coef = self.cfg.algorithm.get("step_value_coef", 1.0)
+
+        # If both step coefficients are 0, use baseline GAE for exact equivalence
+        if step_actor_coef == 0.0 and step_value_coef == 0.0:
+            self.log_info(
+                "Both step_actor_coef and step_value_coef are 0. "
+                "Using baseline GAE instead of hierarchical GAE for memory efficiency and exact baseline equivalence."
+            )
+            return self._compute_baseline_gae_for_hierarchical_config()
+
+        # Get stepwise values: [T, B, num_denoise_steps]
+        stepwise_values = self.rollout_batch.get("stepwise_values")
+        if stepwise_values is None:
+            raise ValueError(
+                "stepwise_values not found in rollout_batch. "
+                "Make sure use_tracevla_value=True in model config."
+            )
+
+        # Get rewards: [T, B, num_action_chunks] for chunk_level reward
+        rewards = self.rollout_batch["rewards"]
+        # Get dones: [T+1, B, num_action_chunks]
+        dones = self.rollout_batch["dones"]
+
+        T, B = rewards.shape[:2]
+        num_denoise_steps = stepwise_values.shape[-1]
+
+        # Sum rewards across action chunks for chunk-level reward
+        # Use [T, B] format (same as baseline - no keepdim!)
+        if self.cfg.algorithm.reward_type == "chunk_level":
+            chunk_rewards = rewards.sum(dim=-1)  # [T, B]
+            chunk_dones = dones.max(dim=-1)[0]  # [T+1, B]
+        else:
+            chunk_rewards = rewards[..., 0]  # [T, B]
+            chunk_dones = dones[..., 0]  # [T+1, B]
+
+        # Get chunk-level values (prev_values from rollout)
+        # Shape: [T+1, B] or [T+1, B, 1] - includes bootstrap value
+        chunk_values = self.rollout_batch.get("prev_values")
+        if chunk_values is None:
+            # Fallback: derive from stepwise values (mean over denoise steps)
+            chunk_values_no_bootstrap = stepwise_values.mean(dim=-1)  # [T, B]
+            bootstrap_value = torch.zeros(
+                1, B, device=chunk_values_no_bootstrap.device, dtype=chunk_values_no_bootstrap.dtype
+            )
+            chunk_values = torch.cat([chunk_values_no_bootstrap, bootstrap_value], dim=0)  # [T+1, B]
+
+        # Squeeze chunk_values if it has extra dimension [T+1, B, 1] -> [T+1, B]
+        if chunk_values.dim() == 3 and chunk_values.shape[-1] == 1:
+            chunk_values = chunk_values.squeeze(-1)  # [T+1, B]
+
+        # Ensure chunk_values has bootstrap dimension [T+1, B]
+        if chunk_values.shape[0] == T:
+            bootstrap_shape = list(chunk_values.shape)
+            bootstrap_shape[0] = 1
+            bootstrap_value = torch.zeros(
+                bootstrap_shape, device=chunk_values.device, dtype=chunk_values.dtype
+            )
+            chunk_values = torch.cat([chunk_values, bootstrap_value], dim=0)
+
+        # Get loss mask if available
+        loss_mask = self.rollout_batch.get("loss_mask", None)
+        loss_mask_for_gae = None
+        if loss_mask is not None:
+            if self.cfg.algorithm.reward_type == "chunk_level":
+                loss_mask_for_gae = loss_mask.any(dim=-1)  # [T, B]
+            else:
+                loss_mask_for_gae = loss_mask[..., 0]  # [T, B]
+
+        # Call hierarchical GAE - uses [T, B] format (same as baseline!)
+        chunk_results, step_results = compute_hierarchical_gae(
+            rewards=chunk_rewards,  # [T, B]
+            chunk_values=chunk_values,  # [T+1, B]
+            stepwise_values=stepwise_values,  # [T, B, num_denoise_steps]
+            num_denoise_steps=num_denoise_steps,
+            chunk_gamma=self.cfg.algorithm.get("chunk_gamma", self.cfg.algorithm.get("gamma", 0.99)),
+            step_gamma=self.cfg.algorithm.get("step_gamma", 1.0),
+            gae_lambda=self.cfg.algorithm.get("gae_lambda", 0.95),
+            step_gae_lambda=self.cfg.algorithm.get("step_gae_lambda", None),
+            normalize_advantages=self.cfg.algorithm.normalize_advantages,
+            loss_mask=loss_mask_for_gae,
+            dones=chunk_dones,  # [T+1, B]
+        )
+
+        # Output is already in [T, B] format (same as baseline!)
+        chunk_advantages = chunk_results["advantages"]  # [T, B]
+        chunk_returns = chunk_results["returns"]  # [T, B]
+        step_advantages = step_results["advantages"]  # [T, B, num_denoise_steps]
+        step_returns = step_results["returns"]  # [T, B, num_denoise_steps]
+
+        # Store in rollout_batch
+        self.rollout_batch.update({
+            "chunk_advantages": chunk_advantages,
+            "chunk_returns": chunk_returns,
+            "step_advantages": step_advantages,
+            "step_returns": step_returns,
+            # Default advantages = chunk_advantages (matches baseline for comparison)
+            # This is used for rollout/advantages_* metrics in tensorboard
+            "advantages": chunk_advantages,
+            # Also store stepwise aliases for compatibility with stepwise loss
+            "stepwise_advantages": step_advantages,
+            "stepwise_returns": step_returns,
+            # Add returns alias for metrics logging (same as chunk_returns)
+            "returns": chunk_returns,
+        })
+
+        if loss_mask is not None:
+            self.rollout_batch["loss_mask"] = loss_mask
+
+        rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        return rollout_metrics
+
+    def _compute_baseline_gae_for_hierarchical_config(self) -> dict[str, torch.Tensor]:
+        """
+        Fallback to baseline GAE when step coefficients are 0.
+        This ensures exact equivalence with baseline PPO.
+
+        When both step_actor_coef and step_value_coef are 0, using hierarchical GAE
+        is wasteful and can cause issues:
+        1. Memory waste: allocates step-level tensors that are never used
+        2. Normalization pollution: step-level advantages affect chunk-level normalization
+        3. Gradient graph contamination: even with @torch.no_grad(), extra computation overhead
+
+        This function provides a clean fallback to baseline GAE computation.
+        """
+        from rlinf.algorithms.advantages import compute_gae_advantages_and_returns
+
+        # Get rewards and dones
+        rewards = self.rollout_batch["rewards"]
+        dones = self.rollout_batch["dones"]
+        T, B = rewards.shape[:2]
+
+        # Sum rewards across action chunks for chunk-level reward
+        if self.cfg.algorithm.reward_type == "chunk_level":
+            chunk_rewards = rewards.sum(dim=-1)  # [T, B]
+            chunk_dones = dones.max(dim=-1)[0]   # [T+1, B]
+        else:
+            chunk_rewards = rewards[..., 0]
+            chunk_dones = dones[..., 0]
+
+        # Get chunk-level values
+        chunk_values = self.rollout_batch.get("prev_values")
+        if chunk_values is None:
+            # Derive from stepwise values if available
+            stepwise_values = self.rollout_batch.get("stepwise_values")
+            if stepwise_values is not None:
+                chunk_values_no_bootstrap = stepwise_values.mean(dim=-1)  # [T, B]
+                bootstrap_value = torch.zeros(
+                    1, B, device=chunk_values_no_bootstrap.device,
+                    dtype=chunk_values_no_bootstrap.dtype
+                )
+                chunk_values = torch.cat([chunk_values_no_bootstrap, bootstrap_value], dim=0)
+            else:
+                raise ValueError("No values found in rollout_batch")
+
+        # Ensure [T+1, B] shape
+        if chunk_values.dim() == 3:
+            chunk_values = chunk_values.squeeze(-1)
+        if chunk_values.shape[0] == T:
+            bootstrap_value = torch.zeros(
+                1, B, device=chunk_values.device, dtype=chunk_values.dtype
+            )
+            chunk_values = torch.cat([chunk_values, bootstrap_value], dim=0)
+
+        # Get loss mask if available
+        loss_mask = self.rollout_batch.get("loss_mask", None)
+        loss_mask_for_gae = None
+        if loss_mask is not None:
+            if self.cfg.algorithm.reward_type == "chunk_level":
+                loss_mask_for_gae = loss_mask.any(dim=-1)  # [T, B]
+            else:
+                loss_mask_for_gae = loss_mask[..., 0]  # [T, B]
+
+        # Compute baseline GAE
+        advantages, returns = compute_gae_advantages_and_returns(
+            rewards=chunk_rewards,
+            values=chunk_values,
+            dones=chunk_dones,
+            gamma=self.cfg.algorithm.get("gamma", 0.99),
+            gae_lambda=self.cfg.algorithm.get("gae_lambda", 0.95),
+            normalize_advantages=self.cfg.algorithm.normalize_advantages,
+            loss_mask=loss_mask_for_gae,
+        )
+
+        # Store in rollout_batch (same format as baseline)
+        self.rollout_batch.update({
+            "advantages": advantages,
+            "returns": returns,
+        })
+
+        # Also store chunk-level aliases for compatibility with hierarchical loss
+        self.rollout_batch.update({
+            "chunk_advantages": advantages,
+            "chunk_returns": returns,
+        })
 
         if loss_mask is not None:
             self.rollout_batch["loss_mask"] = loss_mask
@@ -1569,7 +1795,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         kwargs["prev_logprobs"] = prev_logprobs
 
                     compute_values = (
-                        True if self.cfg.algorithm.adv_type in ["gae", "stepwise_gae"] else False
+                        True if self.cfg.algorithm.adv_type in ["gae", "stepwise_gae", "hierarchical_gae"] else False
                     )
 
                     with self.amp_context:
@@ -1617,6 +1843,74 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,
                         }
                         loss, metrics_data = policy_loss(**kwargs)
+
+                    # ========== Hierarchical Actor-Critic: HUA-RL / FlowRL ==========
+                    elif self.cfg.algorithm.loss_type == "hierarchical_actor_critic":
+                        # Get hierarchical data from batch (old values from rollout)
+                        stepwise_old_logprobs = batch.get("stepwise_logprobs")
+                        stepwise_prev_values = batch.get("stepwise_values")
+
+                        # Chunk-level data
+                        chunk_prev_values = batch.get("prev_values")
+                        chunk_advantages = batch.get("chunk_advantages")
+                        chunk_returns = batch.get("chunk_returns")
+
+                        # Chunk-level logprobs (use same as baseline for consistency!)
+                        # batch["prev_logprobs"] is the old chunk-level logprobs from rollout
+                        # output_dict["logprobs"] is the new chunk-level logprobs from model forward
+                        # These include the initial step (step 0), matching baseline behavior
+                        chunk_old_logprobs = batch.get("prev_logprobs")
+                        chunk_logprobs = output_dict.get("logprobs")
+
+                        # Step-level data
+                        step_advantages = batch.get("step_advantages")
+                        step_returns = batch.get("step_returns")
+
+                        # Get recomputed values from model forward
+                        new_stepwise_logprobs = output_dict.get("stepwise_logprobs", stepwise_old_logprobs)
+                        new_stepwise_values = output_dict.get("stepwise_values", stepwise_prev_values)
+                        new_chunk_values = output_dict.get("values", chunk_prev_values)
+
+                        kwargs = {
+                            "loss_type": self.cfg.algorithm.loss_type,
+                            # Chunk-level inputs
+                            "chunk_values": new_chunk_values,
+                            "chunk_prev_values": chunk_prev_values,
+                            "chunk_advantages": chunk_advantages,
+                            "chunk_returns": chunk_returns,
+                            # Chunk-level logprobs (same as baseline!)
+                            "chunk_logprobs": chunk_logprobs,
+                            "chunk_old_logprobs": chunk_old_logprobs,
+                            # Step-level inputs
+                            "stepwise_logprobs": new_stepwise_logprobs,
+                            "stepwise_old_logprobs": stepwise_old_logprobs,
+                            "stepwise_values": new_stepwise_values,
+                            "stepwise_prev_values": stepwise_prev_values,
+                            "step_advantages": step_advantages,
+                            "step_returns": step_returns,
+                            # Loss hyperparameters
+                            "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+                            "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                            "clip_ratio_c": self.cfg.algorithm.get("clip_ratio_c", None),
+                            "value_clip": self.cfg.algorithm.get("value_clip", 0.2),
+                            "huber_delta": self.cfg.algorithm.get("huber_delta", 10.0),
+                            # Coefficients
+                            "chunk_value_coef": self.cfg.algorithm.get("chunk_value_coef", 0.5),
+                            "step_value_coef": self.cfg.algorithm.get("step_value_coef", 1.0),
+                            "chunk_actor_coef": self.cfg.algorithm.get("chunk_actor_coef", 0.0),
+                            "step_actor_coef": self.cfg.algorithm.get("step_actor_coef", 1.0),
+                            "use_bilevel_actor": self.cfg.algorithm.get("use_bilevel_actor", False),
+                            # Masking and scaling
+                            "loss_mask": loss_mask,
+                            "loss_mask_sum": loss_mask_sum,
+                            "max_episode_steps": self.cfg.env.train.max_episode_steps,
+                            "task_type": self.cfg.runner.task_type,
+                            "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,
+                            # Phase 1 warmup: only chunk_value trains (skip step_value)
+                            "chunk_value_warmup": self.optimizer_steps < self.cfg.actor.optim.get("chunk_value_warmup_steps", 0),
+                        }
+                        loss, metrics_data = policy_loss(**kwargs)
+
                     else:
                         # Original loss computation
                         kwargs = {

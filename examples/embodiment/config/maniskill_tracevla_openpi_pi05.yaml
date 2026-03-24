@@ -32,8 +32,8 @@ runner:
   save_interval: 50
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
-  ckpt_path: "/inspire/hdd/global_user/zhangchenxi-253108310322/RLinf/logs/20260313-13:40:47-maniskill_tracevla_openpi_pi05/maniskill_tracevla_openpi_pi05/checkpoints/global_step_850/actor/model_state_dict/full_weights.pt"  # Optional: path to a .pt checkpoint.
-
+  # ckpt_path: "/inspire/hdd/global_user/zhangchenxi-253108310322/RLinf/logs/20260313-13:40:47-maniskill_tracevla_openpi_pi05/maniskill_tracevla_openpi_pi05/checkpoints/global_step_850/actor/model_state_dict/full_weights.pt"  # Optional: path to a .pt checkpoint.
+  ckpt_path: null
 algorithm:
   normalize_advantages: True
   kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
@@ -138,6 +138,8 @@ rollout:
       joint_logprob: True
       use_tracevla_value: True
       x0_value_embed_dim: 256
+      tracevla_value_mode: "compressed_concat"  # Options: "suffix_x0", "full_concat", "compressed_concat"
+      prefix_value_embed_dim: 512       # For compressed_concat mode
       num_steps: ${actor.model.num_steps}  # Must match actor's num_steps
 actor:
   group_name: "ActorGroup"
@@ -167,6 +169,16 @@ actor:
       # ========== Trace-VLA Model Config ==========
       use_tracevla_value: True    # Use Tweedie x0_pred for value head input
       x0_value_embed_dim: 256     # Embedding dimension for x0_pred projection
+      tracevla_value_mode: "compressed_concat"  # Options: "suffix_x0", "full_concat", "compressed_concat"
+      prefix_value_embed_dim: 512       # For compressed_concat mode
+      # ========== Direct Step-Level Value Config (Alternative to Trace-VLA) ==========
+      # Set use_direct_step_value=True and use_tracevla_value=False to enable
+      use_direct_step_value: False       # Use direct state/x_t/timestep inputs (no suffix_out)
+      step_value_prefix_dim: 128         # Compressed prefix dimension
+      step_value_state_input_dim: 32     # State input dimension (ManiSkill=32)
+      step_value_state_dim: 64           # State projection output dimension
+      step_value_xt_dim: 128             # x_t projection dimension
+      step_value_timestep_dim: 64        # Timestep embedding dimension
     policy_setup: widowx_bridge
 
   optim:

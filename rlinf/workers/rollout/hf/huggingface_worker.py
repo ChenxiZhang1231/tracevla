@@ -14,7 +14,10 @@
 
 import copy
 import gc
+import logging
 from typing import Any, Literal
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 import torch
@@ -447,6 +450,14 @@ class MultiStepRolloutWorker(Worker):
                     stepwise_logprobs=result.get("stepwise_logprobs"),
                     stepwise_values=result.get("stepwise_values"),
                     stepwise_x0_pred=result.get("stepwise_x0_pred"),
+                    # FlowRL data
+                    stepwise_velocities=result.get("stepwise_velocities"),
+                    chunk_values=result.get("chunk_values"),
+                    transport_weights=result.get("transport_weights"),
+                    consistency_scores=result.get("consistency_scores"),
+                    # Progress Reward Model data
+                    progress_values=result.get("progress_values"),
+                    prefix_output=result.get("prefix_output"),
                 )
                 self.send_rollout_result(output_channel, rollout_result, mode="train")
         for _ in range(self.num_pipeline_stages):

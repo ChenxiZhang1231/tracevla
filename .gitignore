@@ -22,3 +22,11 @@ PKG-INFO
 *.egg-info/
 maniskill
 10000
+examples/embodiment/config
+5000
+3000
+8000
+docs
+paper
+CLAUDE.md
+HIERARCHICAL_FIX_SUMMARY

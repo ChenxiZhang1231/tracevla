@@ -130,6 +130,8 @@ rollout:
       joint_logprob: True
       use_tracevla_value: True
       x0_value_embed_dim: 256
+      tracevla_value_mode: "suffix_x0"  # Options: "suffix_x0", "full_concat", "compressed_concat"
+      prefix_value_embed_dim: 512       # For compressed_concat mode
       num_steps: ${actor.model.num_steps}
 
 actor:
@@ -160,6 +162,8 @@ actor:
       # ========== Trace-VLA Model Config ==========
       use_tracevla_value: True    # Use Tweedie x0_pred for value head input
       x0_value_embed_dim: 256     # Embedding dimension for x0_pred projection
+      tracevla_value_mode: "suffix_x0"  # Options: "suffix_x0", "full_concat", "compressed_concat"
+      prefix_value_embed_dim: 512       # For compressed_concat mode
     policy_setup: widowx_bridge
 
   optim:

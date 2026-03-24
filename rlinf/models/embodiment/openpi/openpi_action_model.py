@@ -21,6 +21,7 @@ from typing import Any, Literal
 import jax
 import numpy as np
 import torch
+import torch.nn as nn
 from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.models.pi0_config import Pi0Config
@@ -161,9 +162,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
             # Trace-VLA: Add x0_value_proj for Tweedie's formula
             if self.config.use_tracevla_value:
-                import torch.nn as nn
-                # Use bfloat16 to match the backbone dtype (loaded from checkpoint later)
-                # This ensures all parameters share a single dtype for FSDP
+                # Use bfloat16 to match the backbone dtype (loaded from checkpoint)
+                # FSDP requires uniform dtype for all parameters in a FlatParameter
                 _tracevla_dtype = torch.bfloat16
 
                 # Project flattened x0_pred to embedding space (all modes need this)
@@ -195,7 +195,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 else:
                     raise ValueError(f"Unknown tracevla_value_mode: {self.config.tracevla_value_mode}")
 
-                # Value head with new input dim also needs bfloat16
+                # Step Value head (tracevla) with bfloat16 to match backbone
                 self.value_head = ValueHead(
                     input_dim=value_head_input_dim,
                     hidden_sizes=value_head_hidden_sizes,
@@ -203,8 +203,28 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     activation=value_head_activation,
                     bias_last=True,
                 ).to(dtype=_tracevla_dtype)
+
+                # Hierarchical RL: Create separate chunk_value_head for VLM prefix
+                # This is needed when both value_after_vlm=True and use_tracevla_value=True
+                # - chunk_value_head: VLM prefix -> chunk-level value (for cross-chunk credit)
+                # - value_head: tracevla (suffix + x0_pred) -> step-level value (for within-chunk credit)
+                if self.config.value_after_vlm:
+                    # Set fixed seed for reproducible value head initialization
+                    torch.manual_seed(42)
+                    # Use float32 to match baseline value_head dtype
+                    # Note: Only chunk_value_head uses float32, other tracevla components stay bfloat16
+                    # This works because FSDP handles a single float32 component correctly
+                    self.chunk_value_head = ValueHead(
+                        input_dim=prefix_dim,  # 2048 for Pi0.5
+                        hidden_sizes=value_head_hidden_sizes,
+                        output_dim=1,
+                        activation=value_head_activation,
+                        bias_last=True,
+                    )
             else:
                 value_head_input_dim = proj_width
+                # Set fixed seed for reproducible value head initialization
+                torch.manual_seed(42)
                 self.value_head = ValueHead(
                     input_dim=value_head_input_dim,
                     hidden_sizes=value_head_hidden_sizes,
@@ -908,6 +928,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         compute_values=True,
         return_x0_pred=False,
         prefix_output=None,
+        detach_value_input=False,
     ):
         """
         Sample the mean, variance and value of the action at a given timestep.
@@ -967,8 +988,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 x0_embed = self.x0_value_proj(x0_flat)  # [B, x0_value_embed_dim]
 
                 # Step 4: Prepare suffix_out_value
-                if self.config.detach_critic_input:
-                    suffix_out_value = suffix_out_value.detach()
+                # Warmup: use hook to block gradients instead of detach (FSDP compatible)
+                if self.config.detach_critic_input or detach_value_input:
+                    def zero_grad_hook(grad):
+                        return torch.zeros_like(grad)
+                    suffix_out_value.register_hook(zero_grad_hook)
                 # Ensure suffix_out_value has same dtype as x0_embed for concatenation
                 suffix_out_value = suffix_out_value.to(dtype=x0_proj_dtype)
 
@@ -980,15 +1004,17 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     # Full concat: prefix + suffix + x0
                     assert prefix_output is not None, "prefix_output required for full_concat mode"
                     prefix_mean = prefix_output.mean(dim=1).to(dtype=x0_proj_dtype)
-                    if self.config.detach_critic_input:
-                        prefix_mean = prefix_mean.detach()
+                    # Warmup: use hook to block gradients instead of detach (FSDP compatible)
+                    if self.config.detach_critic_input or detach_value_input:
+                        prefix_mean.register_hook(zero_grad_hook)
                     value_input = torch.cat([prefix_mean, suffix_out_value, x0_embed], dim=-1)
                 elif self.config.tracevla_value_mode == "compressed_concat":
                     # Compressed concat: compressed_prefix + suffix + x0
                     assert prefix_output is not None, "prefix_output required for compressed_concat mode"
                     prefix_mean = prefix_output.mean(dim=1).to(dtype=x0_proj_dtype)
-                    if self.config.detach_critic_input:
-                        prefix_mean = prefix_mean.detach()
+                    # Warmup: use hook to block gradients instead of detach (FSDP compatible)
+                    if self.config.detach_critic_input or detach_value_input:
+                        prefix_mean.register_hook(zero_grad_hook)
                     prefix_embed = self.prefix_value_proj(prefix_mean)
                     value_input = torch.cat([prefix_embed, suffix_out_value, x0_embed], dim=-1)
                 else:
@@ -1004,9 +1030,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     )
                 else:
                     suffix_out_value = torch.mean(suffix_out, dim=1, keepdim=False)
-                # detach critic input
-                if self.config.detach_critic_input:
-                    suffix_out_value = suffix_out_value.detach()
+                # Warmup: use hook to block gradients instead of detach (FSDP compatible)
+                if self.config.detach_critic_input or detach_value_input:
+                    def zero_grad_hook(grad):
+                        return torch.zeros_like(grad)
+                    suffix_out_value.register_hook(zero_grad_hook)
                 value_t = self.value_head(suffix_out_value)[:, 0]
         else:
             value_t = torch.zeros((bsize), device=device)
@@ -1162,6 +1190,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         chains,
         denoise_inds,
         compute_values=False,
+        detach_value_input=False,
     ):
         bsize = state.shape[0]
         prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
@@ -1198,6 +1227,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 self.config.num_steps,
                 compute_values,
                 prefix_output=prefix_output,
+                detach_value_input=detach_value_input,
             )
             log_probs = self.get_logprob_norm(chains_next, x_t_mean, x_t_std)
             entropy = self.gaussian_entropy(x_t_std)
@@ -1206,7 +1236,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             if not self.use_vlm_value:
                 chains_values.append(value_t)
         if self.use_vlm_value:
-            chains_values.append(self.get_value_from_vlm(prefix_output))
+            chains_values.append(self.get_value_from_vlm(prefix_output, detach_value_input=detach_value_input))
         chains_log_probs = torch.stack(chains_log_probs, dim=1)
         chains_values = torch.stack(chains_values, dim=1)
 
@@ -1217,7 +1247,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             chains_entropy = torch.zeros_like(chains_log_probs)
         return chains_log_probs, chains_values, chains_entropy
 
-    def get_value_from_vlm(self, prefix_output):
+    def get_value_from_vlm(self, prefix_output, detach_value_input=False):
+        # Warmup: use hook to block gradients instead of detach (FSDP compatible)
+        if detach_value_input:
+            # Register hook to zero out gradients flowing to backbone
+            def zero_grad_hook(grad):
+                return torch.zeros_like(grad)
+            prefix_output.register_hook(zero_grad_hook)
         # prefix_output:
         # pi05: [bs, (256 * 3 + 200) = 968, 2048]
         # pi0: [bs, (256 * 3 + 48) = 816, 1024]
@@ -1241,10 +1277,17 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             prefix_mask = [True] * 1 + [False] * (all_token_length - 1)
         prefix_out_value = prefix_output[:, prefix_mask, :]
         prefix_out_value = prefix_out_value.mean(dim=1, keepdim=False)
-        # Match input dtype to value_head's dtype
-        value_head_dtype = next(self.value_head.parameters()).dtype
-        prefix_out_value = prefix_out_value.to(dtype=value_head_dtype)
-        values_vlm = self.value_head(prefix_out_value)[:, 0]
+        # Hierarchical RL: Use chunk_value_head if available (for tracevla + value_after_vlm mode)
+        # Otherwise fall back to value_head
+        if hasattr(self, 'chunk_value_head'):
+            value_head_dtype = next(self.chunk_value_head.parameters()).dtype
+            prefix_out_value = prefix_out_value.to(dtype=value_head_dtype)
+            values_vlm = self.chunk_value_head(prefix_out_value)[:, 0]
+        else:
+            # Match input dtype to value_head's dtype
+            value_head_dtype = next(self.value_head.parameters()).dtype
+            prefix_out_value = prefix_out_value.to(dtype=value_head_dtype)
+            values_vlm = self.value_head(prefix_out_value)[:, 0]
         return values_vlm
 
     def gaussian_entropy(self, sigma):

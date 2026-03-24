@@ -365,6 +365,7 @@ class EmbodiedRunner:
             env_results_list = [
                 results for results in env_results if results is not None
             ]
+
             env_metrics = compute_evaluate_metrics(env_results_list)
             env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
             ranked_env_results = [

@@ -347,6 +347,16 @@ class ChunkStepResult:
     stepwise_values: torch.Tensor = None     # [B, num_denoise_steps]
     stepwise_x0_pred: torch.Tensor = None    # [B, num_denoise_steps, action_horizon, action_dim]
 
+    # ========== FlowRL fields ==========
+    stepwise_velocities: torch.Tensor = None  # [B, num_denoise_steps, action_horizon, action_dim]
+    chunk_values: torch.Tensor = None         # [B, num_denoise_steps] or [B]
+    transport_weights: torch.Tensor = None    # [B, num_denoise_steps]
+    consistency_scores: torch.Tensor = None   # [B]
+
+    # ========== Progress Reward Model fields ==========
+    progress_values: torch.Tensor = None      # [B] - predicted progress ∈ [0, 1]
+    prefix_output: torch.Tensor = None        # [B, seq_len, prefix_dim] - VLM prefix output for RM training
+
     def __post_init__(self):
         if self.actions is not None:
             self.actions = self.actions.cpu().contiguous()
@@ -373,6 +383,20 @@ class ChunkStepResult:
             self.stepwise_values = self.stepwise_values.cpu().contiguous()
         if self.stepwise_x0_pred is not None:
             self.stepwise_x0_pred = self.stepwise_x0_pred.cpu().contiguous()
+        # FlowRL fields
+        if self.stepwise_velocities is not None:
+            self.stepwise_velocities = self.stepwise_velocities.cpu().contiguous()
+        if self.chunk_values is not None:
+            self.chunk_values = self.chunk_values.cpu().contiguous()
+        if self.transport_weights is not None:
+            self.transport_weights = self.transport_weights.cpu().contiguous()
+        if self.consistency_scores is not None:
+            self.consistency_scores = self.consistency_scores.cpu().contiguous()
+        # Progress Reward Model fields
+        if self.progress_values is not None:
+            self.progress_values = self.progress_values.cpu().contiguous()
+        if self.prefix_output is not None:
+            self.prefix_output = self.prefix_output.cpu().contiguous()
 
 
 @dataclass
@@ -401,6 +425,16 @@ class Trajectory:
     stepwise_logprobs: torch.Tensor = None   # [T, B, num_denoise_steps, action_chunk, action_dim]
     stepwise_values: torch.Tensor = None     # [T, B, num_denoise_steps]
     stepwise_x0_pred: torch.Tensor = None    # [T, B, num_denoise_steps, action_horizon, action_dim]
+
+    # ========== FlowRL fields ==========
+    stepwise_velocities: torch.Tensor = None  # [T, B, num_denoise_steps, action_horizon, action_dim]
+    chunk_values: torch.Tensor = None         # [T, B, num_denoise_steps] or [T, B]
+    transport_weights: torch.Tensor = None    # [T, B, num_denoise_steps]
+    consistency_scores: torch.Tensor = None   # [T, B]
+
+    # ========== Progress Reward Model fields ==========
+    progress_values: torch.Tensor = None      # [T, B] - predicted progress ∈ [0, 1]
+    prefix_output: torch.Tensor = None        # [T, B, seq_len, prefix_dim] - VLM prefix for RM training
 
     @staticmethod
     def _generate_field_mask(
@@ -554,6 +588,16 @@ class EmbodiedRolloutResult:
     stepwise_values: list[torch.Tensor] = field(default_factory=list)    # trajectory_length
     stepwise_x0_pred: list[torch.Tensor] = field(default_factory=list)   # trajectory_length
 
+    # ========== FlowRL fields ==========
+    stepwise_velocities: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
+    chunk_values: list[torch.Tensor] = field(default_factory=list)         # trajectory_length
+    transport_weights: list[torch.Tensor] = field(default_factory=list)    # trajectory_length
+    consistency_scores: list[torch.Tensor] = field(default_factory=list)   # trajectory_length
+
+    # ========== Progress Reward Model fields ==========
+    progress_values: list[torch.Tensor] = field(default_factory=list)      # trajectory_length
+    prefix_output: list[torch.Tensor] = field(default_factory=list)        # trajectory_length
+
     def append_step_result(self, result: ChunkStepResult):
         if result.actions is not None:
             self.actions.append(result.actions)
@@ -583,6 +627,20 @@ class EmbodiedRolloutResult:
             self.stepwise_values.append(result.stepwise_values)
         if result.stepwise_x0_pred is not None:
             self.stepwise_x0_pred.append(result.stepwise_x0_pred)
+        # FlowRL fields
+        if result.stepwise_velocities is not None:
+            self.stepwise_velocities.append(result.stepwise_velocities)
+        if result.chunk_values is not None:
+            self.chunk_values.append(result.chunk_values)
+        if result.transport_weights is not None:
+            self.transport_weights.append(result.transport_weights)
+        if result.consistency_scores is not None:
+            self.consistency_scores.append(result.consistency_scores)
+        # Progress Reward Model fields
+        if result.progress_values is not None:
+            self.progress_values.append(result.progress_values)
+        if result.prefix_output is not None:
+            self.prefix_output.append(result.prefix_output)
 
     def mark_last_step_with_flags(self, save_flags: torch.Tensor):
         if not self.intervene_flags:
@@ -718,6 +776,32 @@ class EmbodiedRolloutResult:
         if len(self.stepwise_x0_pred) > 0:
             trajectory.stepwise_x0_pred = (
                 torch.stack(self.stepwise_x0_pred, dim=0).cpu().contiguous()
+            )
+        # FlowRL fields
+        if len(self.stepwise_velocities) > 0:
+            trajectory.stepwise_velocities = (
+                torch.stack(self.stepwise_velocities, dim=0).cpu().contiguous()
+            )
+        if len(self.chunk_values) > 0:
+            trajectory.chunk_values = (
+                torch.stack(self.chunk_values, dim=0).cpu().contiguous()
+            )
+        if len(self.transport_weights) > 0:
+            trajectory.transport_weights = (
+                torch.stack(self.transport_weights, dim=0).cpu().contiguous()
+            )
+        if len(self.consistency_scores) > 0:
+            trajectory.consistency_scores = (
+                torch.stack(self.consistency_scores, dim=0).cpu().contiguous()
+            )
+        # Progress Reward Model fields
+        if len(self.progress_values) > 0:
+            trajectory.progress_values = (
+                torch.stack(self.progress_values, dim=0).cpu().contiguous()
+            )
+        if len(self.prefix_output) > 0:
+            trajectory.prefix_output = (
+                torch.stack(self.prefix_output, dim=0).cpu().contiguous()
             )
         return trajectory
 

@@ -150,6 +150,30 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
         }
         rollout_metrics.update(advantages_metrics)
 
+    # Add step_advantages metrics for hierarchical GAE (separate from chunk-level advantages)
+    if data_buffer.get("step_advantages", None) is not None:
+        step_advantages = data_buffer["step_advantages"]
+        mean_step_adv = torch.mean(step_advantages).to(Worker.torch_platform.current_device())
+        torch.distributed.all_reduce(mean_step_adv, op=torch.distributed.ReduceOp.AVG)
+        max_step_adv = torch.max(step_advantages).detach().item()
+        min_step_adv = torch.min(step_advantages).detach().item()
+        reduce_step_adv_tensor = torch.as_tensor(
+            [-min_step_adv, max_step_adv],
+            device=Worker.torch_platform.current_device(),
+            dtype=torch.float32,
+        )
+        torch.distributed.all_reduce(
+            reduce_step_adv_tensor, op=torch.distributed.ReduceOp.MAX
+        )
+        min_step_adv, max_step_adv = reduce_step_adv_tensor.tolist()
+
+        step_advantages_metrics = {
+            "step_advantages_mean": mean_step_adv.item(),
+            "step_advantages_max": max_step_adv,
+            "step_advantages_min": -min_step_adv,
+        }
+        rollout_metrics.update(step_advantages_metrics)
+
     if data_buffer.get("returns", None) is not None:
         returns = data_buffer["returns"]
         mean_ret = torch.mean(returns).to(Worker.torch_platform.current_device())
@@ -172,6 +196,30 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
             "returns_min": -min_ret,
         }
         rollout_metrics.update(returns_metrics)
+
+    # Add step_returns metrics for hierarchical GAE (separate from chunk-level returns)
+    if data_buffer.get("step_returns", None) is not None:
+        step_returns = data_buffer["step_returns"]
+        mean_step_ret = torch.mean(step_returns).to(Worker.torch_platform.current_device())
+        torch.distributed.all_reduce(mean_step_ret, op=torch.distributed.ReduceOp.AVG)
+        max_step_ret = torch.max(step_returns).detach().item()
+        min_step_ret = torch.min(step_returns).detach().item()
+        reduce_step_ret_tensor = torch.as_tensor(
+            [-min_step_ret, max_step_ret],
+            device=Worker.torch_platform.current_device(),
+            dtype=torch.float32,
+        )
+        torch.distributed.all_reduce(
+            reduce_step_ret_tensor, op=torch.distributed.ReduceOp.MAX
+        )
+        min_step_ret, max_step_ret = reduce_step_ret_tensor.tolist()
+
+        step_returns_metrics = {
+            "step_returns_mean": mean_step_ret.item(),
+            "step_returns_max": max_step_ret,
+            "step_returns_min": -min_step_ret,
+        }
+        rollout_metrics.update(step_returns_metrics)
 
     # Add outer_returns metrics for hierarchical GAE debugging
     if data_buffer.get("outer_returns", None) is not None:

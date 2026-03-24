@@ -256,13 +256,16 @@ class FSDPModelManager:
         else:
             self._logger.info("[FSDP] Gradient checkpointing is disabled")
 
+        # Note: We use loss-based warmup instead of param freezing because FSDP has limitations:
+        # - use_orig_params=True: cannot modify requires_grad after wrapping
+        # - use_orig_params=False: requires uniform requires_grad
+        # The loss function handles warmup by zeroing out specific losses during warmup phases.
+
         # build model, optimizer, lr_scheduler, grad_scaler
         self.model = self._strategy.wrap_model(
             model=module, device_mesh=self._device_mesh
         )
-        self.optimizer = self.build_optimizer(
-            model=self.model, enable_critic_warmup=self.critic_warmup_steps > 0
-        )
+        self.optimizer = self.build_optimizer(model=self.model)
 
         self.lr_scheduler = self.build_lr_scheduler(
             optimizer=self.optimizer, optim_config=self._cfg.optim
@@ -389,8 +392,10 @@ class FSDPModelManager:
         Returns:
             A tuple of (grad_norm, lr_list), lr_list contains learning rates for all param groups.
         """
+        import torch  # Move import to top of function
         self.optimizer_steps += 1
         self.grad_scaler.unscale_(self.optimizer)
+
         grad_norm = self._strategy.clip_grad_norm_(
             model=self.model,
         )
@@ -404,13 +409,9 @@ class FSDPModelManager:
 
         self.grad_scaler.update()
 
-        if self.critic_warmup_steps > 0:
-            lr_list = [0.0 for _ in self.optimizer.param_groups]
-            if self.optimizer_steps >= self.critic_warmup_steps:
-                self.optimizer = self.build_optimizer(model=self.model)
-                self.critic_warmup_steps = 0
-        else:
-            lr_list = [group["lr"] for group in self.optimizer.param_groups]
+        # Note: We use loss-based warmup, so no optimizer rebuild is needed.
+        # The loss function handles warmup by zeroing out specific losses.
+        lr_list = [group["lr"] for group in self.optimizer.param_groups]
 
         return grad_norm, lr_list
 
@@ -472,19 +473,25 @@ class FSDPModelManager:
 
         if enable_critic_warmup:
             self._logger.info("[FSDP] Enable critic warmup for value head.")
+            # Params were already frozen before FSDP wrapping in setup_model_and_optimizer
+            # Just collect the trainable params (only value_head should have requires_grad=True)
             for name, param in model.named_parameters():
                 if param.requires_grad:
-                    self.store_requires_grad_param_name.append(name)
+                    if "progress_reward_model" in name:
+                        continue
                     if "value_head" in name or "model.value_head" in name:
                         params_critic.append(param)
-                        continue
-                    param.requires_grad = False
+                    # Non-value-head params should already be frozen, but just in case
+                    # we don't add them to any param group
 
         else:
             for name, param in model.named_parameters():
                 if name in self.store_requires_grad_param_name:
                     param.requires_grad = True
                 if param.requires_grad:
+                    # Skip progress_reward_model - it has its own training loop
+                    if "progress_reward_model" in name:
+                        continue
                     if "value_head" in name or "model.value_head" in name:
                         params_critic.append(param)
                     else:

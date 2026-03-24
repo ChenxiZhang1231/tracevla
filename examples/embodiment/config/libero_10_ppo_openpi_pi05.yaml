@@ -113,20 +113,20 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model/RLinf-Pi05-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-SFT
+    model_path: "8000"
     precision: ${actor.model.precision}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 128
-  global_batch_size: 2048 # maximum : global batch size = micro batch size * actor num_processes.
+  micro_batch_size: 16
+  global_batch_size: 1024 # maximum : global batch size = micro batch size * actor num_processes.
   seed: 42
   enable_offload: False
 
   # Override the default values in model/pi0_5
   model:
-    model_path: "/path/to/model/RLinf-Pi05-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-SFT
+    model_path: "8000"
     model_type: "openpi"
     add_value_head: True
     # openpi specific parameters

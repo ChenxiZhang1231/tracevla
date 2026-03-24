@@ -355,6 +355,7 @@ def compute_ppo_critic_loss(
         returns - value_pred_clipped, huber_delta
     )  # [bsz, ] | [bsz, chunk-step]
     value_loss = torch.max(value_loss_original, value_loss_clipped)
+
     value_loss = loss_agg_func(value_loss, loss_mask, loss_mask_ratio)
 
     value_clip_indicator = (value_pred_clipped - prev_values).abs() > value_clip
@@ -627,5 +628,258 @@ def compute_stepwise_actor_critic_loss(**kwargs) -> tuple[torch.Tensor, dict]:
     metrics = {**actor_metrics, **critic_metrics}
     metrics["loss/stepwise_total"] = total_loss.detach()
 
+    return total_loss, metrics
+
+
+@register_policy_loss("hierarchical_actor_critic")
+def compute_hierarchical_actor_critic_loss(
+    # Chunk-level inputs
+    chunk_values: torch.Tensor = None,
+    chunk_prev_values: torch.Tensor = None,
+    chunk_advantages: torch.Tensor = None,
+    chunk_returns: torch.Tensor = None,
+    # Step-level inputs
+    stepwise_logprobs: torch.Tensor = None,
+    stepwise_old_logprobs: torch.Tensor = None,
+    stepwise_values: torch.Tensor = None,
+    stepwise_prev_values: torch.Tensor = None,
+    step_advantages: torch.Tensor = None,
+    step_returns: torch.Tensor = None,
+    # Loss hyperparameters
+    clip_ratio_low: float = 0.2,
+    clip_ratio_high: float = 0.2,
+    clip_ratio_c: float = None,
+    value_clip: float = 0.2,
+    huber_delta: float = 10.0,
+    # Coefficients
+    chunk_value_coef: float = 0.5,
+    step_value_coef: float = 1.0,
+    chunk_actor_coef: float = 0.0,
+    step_actor_coef: float = 1.0,
+    use_bilevel_actor: bool = False,
+    # Step weighting
+    step_weights: torch.Tensor = None,
+    uncertainty_mode: str = "linear",
+    use_uncertainty_weighting: bool = False,
+    # Masking and scaling
+    loss_mask: torch.Tensor = None,
+    loss_mask_sum: torch.Tensor = None,
+    max_episode_steps: int = None,
+    critic_warmup: bool = False,
+    chunk_value_warmup: bool = False,  # Phase 1: only chunk_value trains (skip step_value)
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Compute Hierarchical Actor-Critic Loss for FlowRL/HUA-RL.
+
+    This loss function supports:
+    1. Chunk-level critic loss (value clipping with huber loss)
+    2. Chunk-level actor loss (PPO clipping with per-dim ratio)
+    3. Step-level actor loss (PPO with optional uncertainty weighting)
+    4. Step-level critic loss (with optional uncertainty weighting)
+    """
+    metrics = {}
+    device = chunk_values.device if chunk_values is not None else stepwise_values.device
+    total_loss = torch.tensor(0.0, device=device)
+
+    # Get dimensions
+    if stepwise_logprobs is not None:
+        if stepwise_logprobs.dim() == 4:
+            B, num_chunks, T = stepwise_logprobs.shape[:3]
+        else:
+            B = stepwise_logprobs.shape[0]
+            num_chunks = 1
+            T = stepwise_logprobs.shape[1] if stepwise_logprobs.dim() > 1 else 1
+
+    # Determine loss aggregation function
+    use_loss_scaling = (
+        max_episode_steps is not None
+        and loss_mask_sum is not None
+        and loss_mask is not None
+    )
+    if use_loss_scaling:
+        loss_mask_ratio = (loss_mask_sum * 1.0) / max_episode_steps
+    else:
+        loss_mask_ratio = None
+
+    # Prepare chunk_loss_mask (reduce to [B] if needed)
+    chunk_loss_mask = loss_mask
+    chunk_loss_mask_ratio = loss_mask_ratio
+    if loss_mask is not None and loss_mask.dim() > 1:
+        chunk_loss_mask = loss_mask.any(dim=-1).float()
+        if loss_mask_ratio is not None:
+            chunk_loss_mask_ratio = loss_mask_ratio.mean(dim=-1)
+
+    # ===== 1. Chunk-Level Critic Loss (reuse baseline) =====
+    # Note: Chunk critic loss is computed even during warmup (to stabilize chunk_value first)
+    if chunk_values is not None and chunk_returns is not None:
+        # Prepare chunk_loss_mask_sum for proper scaling
+        chunk_loss_mask_sum = None
+        if loss_mask_sum is not None:
+            if loss_mask_sum.dim() > 1:
+                chunk_loss_mask_sum = loss_mask_sum.mean(dim=-1)
+            else:
+                chunk_loss_mask_sum = loss_mask_sum
+
+        chunk_critic_loss, chunk_critic_metrics = compute_ppo_critic_loss(
+            values=chunk_values,
+            returns=chunk_returns,
+            prev_values=chunk_prev_values,
+            value_clip=value_clip,
+            huber_delta=huber_delta,
+            loss_mask=chunk_loss_mask.bool() if chunk_loss_mask is not None else None,
+            max_episode_steps=max_episode_steps,
+            loss_mask_sum=chunk_loss_mask_sum,
+        )
+
+        total_loss = total_loss + chunk_value_coef * chunk_critic_loss
+        # Rename metrics: critic/* -> critic/chunk_*
+        for k, v in chunk_critic_metrics.items():
+            metrics[k.replace("critic/", "critic/chunk_")] = v
+
+    # ===== 2. Chunk-Level Actor Loss (reuse baseline) =====
+    if use_bilevel_actor and chunk_advantages is not None and chunk_actor_coef > 0 and not critic_warmup:
+        # Get chunk logprobs (may be passed directly or derived from stepwise)
+        chunk_logprobs = kwargs.get("chunk_logprobs", None)
+        chunk_old_logprobs = kwargs.get("chunk_old_logprobs", None)
+
+        if chunk_logprobs is not None and chunk_old_logprobs is not None:
+            chunk_logprobs_input = chunk_logprobs
+            chunk_old_logprobs_input = chunk_old_logprobs
+        elif stepwise_logprobs is not None:
+            # Derive from stepwise logprobs
+            if stepwise_logprobs.dim() == 4:
+                chunk_logprobs_input = stepwise_logprobs.mean(dim=1)
+                chunk_old_logprobs_input = stepwise_old_logprobs.mean(dim=1)
+            else:
+                chunk_logprobs_input = stepwise_logprobs
+                chunk_old_logprobs_input = stepwise_old_logprobs
+        else:
+            raise ValueError("No logprobs available for chunk actor loss")
+
+        # Sum logprobs over action dimensions (like baseline's chunk_level)
+        chunk_logprobs_sum = chunk_logprobs_input.sum(dim=list(range(1, chunk_logprobs_input.dim())))
+        chunk_old_logprobs_sum = chunk_old_logprobs_input.sum(dim=list(range(1, chunk_old_logprobs_input.dim())))
+
+        # Get advantages
+        if chunk_advantages.dim() == 1:
+            chunk_adv = chunk_advantages
+        else:
+            chunk_adv = chunk_advantages.mean(dim=-1) if chunk_advantages.dim() > 1 else chunk_advantages
+
+        # Prepare chunk_loss_mask_sum for proper scaling
+        chunk_loss_mask_sum = None
+        if loss_mask_sum is not None:
+            if loss_mask_sum.dim() > 1:
+                chunk_loss_mask_sum = loss_mask_sum.mean(dim=-1)
+            else:
+                chunk_loss_mask_sum = loss_mask_sum
+
+        # Reuse baseline actor loss
+        chunk_actor_loss, chunk_actor_metrics = compute_ppo_actor_loss(
+            logprobs=chunk_logprobs_sum.float(),
+            old_logprobs=chunk_old_logprobs_sum.float(),
+            advantages=chunk_adv.float(),
+            clip_ratio_low=clip_ratio_low,
+            clip_ratio_high=clip_ratio_high,
+            clip_ratio_c=clip_ratio_c,
+            loss_mask=chunk_loss_mask.bool() if chunk_loss_mask is not None else None,
+            max_episode_steps=max_episode_steps,
+            loss_mask_sum=chunk_loss_mask_sum,
+            critic_warmup=False,  # Already checked above
+        )
+
+        total_loss = total_loss + chunk_actor_coef * chunk_actor_loss
+        # Rename metrics: actor/* -> actor/chunk_*
+        for k, v in chunk_actor_metrics.items():
+            metrics[k.replace("actor/", "actor/chunk_")] = v
+
+    # ===== 3. Step-Level Critic Loss (optional) =====
+    # Note: Skip during chunk_value_warmup (phase 1: only chunk_value trains)
+    # Phase 2 (critic_warmup but not chunk_value_warmup): step_value trains with chunk_value
+    if step_value_coef > 0 and stepwise_values is not None and step_returns is not None and not chunk_value_warmup:
+        # Flatten for processing: [B, num_chunks, T] -> [B*num_chunks, T] or similar
+        stepwise_values_flat = stepwise_values.reshape(-1, stepwise_values.shape[-1]) if stepwise_values.dim() > 2 else stepwise_values
+        stepwise_prev_values_flat = stepwise_prev_values.reshape(-1, stepwise_prev_values.shape[-1]) if stepwise_prev_values.dim() > 2 else stepwise_prev_values
+        step_returns_flat = step_returns.reshape(-1, step_returns.shape[-1]) if step_returns.dim() > 2 else step_returns
+
+        step_pred_clipped = stepwise_prev_values_flat + (
+            stepwise_values_flat - stepwise_prev_values_flat
+        ).clamp(-value_clip, value_clip)
+
+        step_loss_orig = huber_loss(step_returns_flat - stepwise_values_flat, huber_delta)
+        step_loss_clip = huber_loss(step_returns_flat - step_pred_clipped, huber_delta)
+        step_critic_loss_per_step = torch.max(step_loss_orig, step_loss_clip)
+
+        # Apply uncertainty weighting if enabled
+        if use_uncertainty_weighting and step_weights is not None:
+            step_weights_flat = step_weights.reshape(-1, step_weights.shape[-1]) if step_weights.dim() > 2 else step_weights
+            if step_weights_flat.shape != step_critic_loss_per_step.shape:
+                step_weights_flat = step_weights_flat.expand_as(step_critic_loss_per_step)
+            weighted_step_critic = step_critic_loss_per_step * step_weights_flat
+            weight_sum = step_weights_flat.sum().clamp(min=1)
+            step_critic_loss = weighted_step_critic.sum() / weight_sum
+            metrics["uncertainty/hierarchical_weight_mean"] = step_weights_flat.mean().detach()
+            metrics["uncertainty/hierarchical_weight_std"] = step_weights_flat.std().detach()
+        else:
+            step_critic_loss = step_critic_loss_per_step.mean()
+
+        total_loss = total_loss + step_value_coef * step_critic_loss
+        metrics["critic/hierarchical_step_value_loss"] = step_critic_loss.detach()
+
+        # Compute explained variance
+        with torch.no_grad():
+            returns_var = step_returns_flat.var()
+            if returns_var > 1e-8:
+                residual_var = (step_returns_flat - stepwise_values_flat).var()
+                explained_var = 1 - residual_var / returns_var
+                metrics["critic/hierarchical_explained_variance"] = explained_var.detach()
+
+    # ===== 4. Step-Level Actor Loss (hierarchical) =====
+    # Note: Skip during critic_warmup to let chunk_value stabilize first
+    if step_actor_coef > 0 and stepwise_logprobs is not None and step_advantages is not None and not critic_warmup:
+        # Flatten logprobs: [B, num_chunks, T, action_chunk, action_dim] -> [B*num_chunks, T, ...]
+        stepwise_logprobs_flat = stepwise_logprobs.reshape(-1, *stepwise_logprobs.shape[-3:]) if stepwise_logprobs.dim() > 4 else stepwise_logprobs
+        stepwise_old_logprobs_flat = stepwise_old_logprobs.reshape(-1, *stepwise_old_logprobs.shape[-3:]) if stepwise_old_logprobs.dim() > 4 else stepwise_old_logprobs
+        step_advantages_flat = step_advantages.reshape(-1, step_advantages.shape[-1]) if step_advantages.dim() > 2 else step_advantages
+
+        # Sum logprobs over action dimensions: [..., T, action_chunk, action_dim] -> [..., T]
+        logprobs_sum = stepwise_logprobs_flat.sum(dim=(-1, -2)) if stepwise_logprobs_flat.dim() >= 3 else stepwise_logprobs_flat.sum(dim=-1)
+        old_logprobs_sum = stepwise_old_logprobs_flat.sum(dim=(-1, -2)) if stepwise_old_logprobs_flat.dim() >= 3 else stepwise_old_logprobs_flat.sum(dim=-1)
+
+        log_ratio = (logprobs_sum - old_logprobs_sum).clamp(-10.0, 10.0)
+        ratio = torch.exp(log_ratio)
+        clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high)
+
+        policy_loss1 = -step_advantages_flat * ratio
+        policy_loss2 = -step_advantages_flat * clipped_ratio
+        policy_loss_per_step = torch.max(policy_loss1, policy_loss2)
+
+        # Apply uncertainty weighting if enabled
+        if use_uncertainty_weighting and step_weights is not None:
+            step_weights_flat = step_weights.reshape(-1, step_weights.shape[-1]) if step_weights.dim() > 2 else step_weights
+            if step_weights_flat.shape != policy_loss_per_step.shape:
+                step_weights_flat = step_weights_flat.expand_as(policy_loss_per_step)
+            weighted_policy_loss = policy_loss_per_step * step_weights_flat
+            weight_sum = step_weights_flat.sum().clamp(min=1)
+            actor_loss = weighted_policy_loss.sum() / weight_sum
+        else:
+            if loss_mask is not None:
+                flat_mask = loss_mask.reshape(-1) if loss_mask.dim() > 1 else loss_mask
+                if flat_mask.shape[0] == policy_loss_per_step.shape[0]:
+                    flat_mask = flat_mask.unsqueeze(-1).expand_as(policy_loss_per_step)
+                actor_loss = (policy_loss_per_step * flat_mask).sum() / flat_mask.sum().clamp(min=1)
+            else:
+                actor_loss = policy_loss_per_step.mean()
+
+        total_loss = total_loss + step_actor_coef * actor_loss
+        metrics["actor/hierarchical_policy_loss"] = actor_loss.detach()
+
+        with torch.no_grad():
+            metrics["actor/hierarchical_approx_kl"] = log_ratio.mean().detach()
+            metrics["actor/hierarchical_clip_fraction"] = (policy_loss1 < policy_loss2).float().mean().detach()
+            metrics["actor/hierarchical_ratio"] = ratio.mean().detach()
+
+    metrics["loss/hierarchical_total"] = total_loss.detach()
     return total_loss, metrics
 
