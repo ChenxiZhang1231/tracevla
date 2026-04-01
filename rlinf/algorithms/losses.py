@@ -708,7 +708,7 @@ def compute_hierarchical_actor_critic_loss(
     if loss_mask is not None and loss_mask.dim() > 1:
         chunk_loss_mask = loss_mask.any(dim=-1).float()
         if loss_mask_ratio is not None:
-            chunk_loss_mask_ratio = loss_mask_ratio.mean(dim=-1)
+            chunk_loss_mask_ratio = loss_mask_ratio.float().mean(dim=-1)
 
     # ===== 1. Chunk-Level Critic Loss (reuse baseline) =====
     # Note: Chunk critic loss is computed even during warmup (to stabilize chunk_value first)
@@ -716,10 +716,12 @@ def compute_hierarchical_actor_critic_loss(
         # Prepare chunk_loss_mask_sum for proper scaling
         chunk_loss_mask_sum = None
         if loss_mask_sum is not None:
-            if loss_mask_sum.dim() > 1:
-                chunk_loss_mask_sum = loss_mask_sum.mean(dim=-1)
+            # Convert to float for mean computation
+            loss_mask_sum_float = loss_mask_sum.float()
+            if loss_mask_sum_float.dim() > 1:
+                chunk_loss_mask_sum = loss_mask_sum_float.mean(dim=-1)
             else:
-                chunk_loss_mask_sum = loss_mask_sum
+                chunk_loss_mask_sum = loss_mask_sum_float
 
         chunk_critic_loss, chunk_critic_metrics = compute_ppo_critic_loss(
             values=chunk_values,
@@ -770,10 +772,12 @@ def compute_hierarchical_actor_critic_loss(
         # Prepare chunk_loss_mask_sum for proper scaling
         chunk_loss_mask_sum = None
         if loss_mask_sum is not None:
-            if loss_mask_sum.dim() > 1:
-                chunk_loss_mask_sum = loss_mask_sum.mean(dim=-1)
+            # Convert to float for mean computation
+            loss_mask_sum_float = loss_mask_sum.float()
+            if loss_mask_sum_float.dim() > 1:
+                chunk_loss_mask_sum = loss_mask_sum_float.mean(dim=-1)
             else:
-                chunk_loss_mask_sum = loss_mask_sum
+                chunk_loss_mask_sum = loss_mask_sum_float
 
         # Reuse baseline actor loss
         chunk_actor_loss, chunk_actor_metrics = compute_ppo_actor_loss(

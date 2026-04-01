@@ -17,12 +17,12 @@ import gc
 import logging
 from typing import Any, Literal
 
-logger = logging.getLogger(__name__)
-
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
