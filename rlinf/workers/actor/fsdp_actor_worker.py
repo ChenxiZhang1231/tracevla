@@ -1834,8 +1834,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             "stepwise_prev_values": stepwise_prev_values,
                             "advantages": stepwise_advantages,
                             "returns": stepwise_returns,
-                            "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
-                            "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                            "clip_ratio_high": self.cfg.algorithm.get("clip_ratio_high", 0.2),
+                            "clip_ratio_low": self.cfg.algorithm.get("clip_ratio_low", 0.2),
                             "value_clip": self.cfg.algorithm.get("value_clip", None),
                             "huber_delta": self.cfg.algorithm.get("huber_delta", None),
                             "loss_mask": loss_mask,
@@ -1845,7 +1845,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         loss, metrics_data = policy_loss(**kwargs)
 
                     # ========== Hierarchical Actor-Critic: HUA-RL / FlowRL ==========
-                    elif self.cfg.algorithm.loss_type == "hierarchical_actor_critic":
+                    elif self.cfg.algorithm.loss_type in ["hierarchical_actor_critic", "hierarchical_q_maximization"]:
                         # Get hierarchical data from batch (old values from rollout)
                         stepwise_old_logprobs = batch.get("stepwise_logprobs")
                         stepwise_prev_values = batch.get("stepwise_values")
@@ -1889,8 +1889,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             "step_advantages": step_advantages,
                             "step_returns": step_returns,
                             # Loss hyperparameters
-                            "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
-                            "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                            "clip_ratio_high": self.cfg.algorithm.get("clip_ratio_high", 0.2),
+                            "clip_ratio_low": self.cfg.algorithm.get("clip_ratio_low", 0.2),
                             "clip_ratio_c": self.cfg.algorithm.get("clip_ratio_c", None),
                             "value_clip": self.cfg.algorithm.get("value_clip", 0.2),
                             "huber_delta": self.cfg.algorithm.get("huber_delta", 10.0),
@@ -1900,6 +1900,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             "chunk_actor_coef": self.cfg.algorithm.get("chunk_actor_coef", 0.0),
                             "step_actor_coef": self.cfg.algorithm.get("step_actor_coef", 1.0),
                             "use_bilevel_actor": self.cfg.algorithm.get("use_bilevel_actor", False),
+                            "step_actor_lr_scale": self.cfg.algorithm.get("step_actor_lr_scale", 1.0),
+                            # Q-maximization parameters (for hierarchical_q_maximization)
+                            "q_weight_mode": self.cfg.algorithm.get("q_weight_mode", "constant"),
+                            "q_weight_value": self.cfg.algorithm.get("q_weight_value", 1.0),
+                            "q_timestep_schedule": self.cfg.algorithm.get("q_timestep_schedule", "linear"),
+                            "q_value_normalization": self.cfg.algorithm.get("q_value_normalization", False),
+                            "step_actor_lr_scale": self.cfg.algorithm.get("step_actor_lr_scale", 1.0),
+                            # Step sampling for memory efficiency
+                            "step_sample_ratio": self.cfg.algorithm.get("step_sample_ratio", 1.0),
                             # Masking and scaling
                             "loss_mask": loss_mask,
                             "loss_mask_sum": loss_mask_sum,
@@ -1924,8 +1933,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             "advantages": advantages,
                             "returns": returns,
                             "prev_values": prev_values,
-                            "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
-                            "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                            "clip_ratio_high": self.cfg.algorithm.get("clip_ratio_high", 0.2),
+                            "clip_ratio_low": self.cfg.algorithm.get("clip_ratio_low", 0.2),
                             "value_clip": self.cfg.algorithm.get("value_clip", None),
                             "huber_delta": self.cfg.algorithm.get("huber_delta", None),
                             "loss_mask": loss_mask,

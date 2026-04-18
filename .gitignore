@@ -22,7 +22,7 @@ PKG-INFO
 *.egg-info/
 maniskill
 10000
-examples/embodiment/config
+# examples/embodiment/config
 5000
 3000
 8000

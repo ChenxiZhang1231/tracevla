@@ -14,7 +14,7 @@
 
 import math
 import random
-from collections.abc import Sequence
+from collections.abc import Sequence 
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -70,9 +70,11 @@ class OpenPi0Config(Pi0Config):
     # ===== Trace-VLA parameters =====
     use_tracevla_value: bool = False  # Use Tweedie x0_pred for value head input
     x0_value_embed_dim: int = 256     # Embedding dimension for x0_pred projection
-    # Value head mode: "suffix_x0", "full_concat", "compressed_concat"
+    # Value head mode: "suffix_x0", "full_concat", "compressed_concat", "prefix_x0_t"
     tracevla_value_mode: str = "suffix_x0"
     prefix_value_embed_dim: int = 512  # For compressed_concat mode
+    # For prefix_x0_t mode: if None, use uncompressed prefix (2048); otherwise compress to this dim
+    prefix_x0_t_compress_dim: int = None  # None = no compression, or specify dim (e.g., 512)
 
     # ===== DSRL-specific parameters =====
     use_dsrl: bool = False  # Enable DSRL algorithm
@@ -174,6 +176,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     bias=True
                 ).to(dtype=_tracevla_dtype)
 
+                # Timestep embedding projection (for prefix_x0_t mode)
+                self.timestep_value_proj = nn.Linear(
+                    1,  # timestep is a scalar
+                    64,  # timestep embedding dim
+                    bias=True
+                ).to(dtype=_tracevla_dtype)
+
                 # Calculate value_head_input_dim based on mode
                 suffix_dim = 1024  # proj_width when value_after_vlm=False
                 prefix_dim = 2048  # VLM output dimension for Pi0.5
@@ -192,6 +201,28 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                         bias=True
                     ).to(dtype=_tracevla_dtype)
                     value_head_input_dim = self.config.prefix_value_embed_dim + suffix_dim + self.config.x0_value_embed_dim
+                elif self.config.tracevla_value_mode == "prefix_x0_t":
+                    # New mode: prefix + timestep + x0
+                    # No suffix_out, no noise action (x_t)
+                    timestep_embed_dim = 64
+
+                    # Check if prefix compression is enabled
+                    if self.config.prefix_x0_t_compress_dim is not None:
+                        # Compressed prefix mode
+                        self.prefix_x0_t_proj = nn.Linear(
+                            prefix_dim,
+                            self.config.prefix_x0_t_compress_dim,
+                            bias=True
+                        ).to(dtype=_tracevla_dtype)
+                        value_head_input_dim = (
+                            self.config.prefix_x0_t_compress_dim +
+                            timestep_embed_dim +
+                            self.config.x0_value_embed_dim
+                        )
+                    else:
+                        # Uncompressed prefix mode (default)
+                        value_head_input_dim = prefix_dim + timestep_embed_dim + self.config.x0_value_embed_dim
+                        # = 2048 + 64 + 256 = 2368
                 else:
                     raise ValueError(f"Unknown tracevla_value_mode: {self.config.tracevla_value_mode}")
 
@@ -211,16 +242,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 if self.config.value_after_vlm:
                     # Set fixed seed for reproducible value head initialization
                     torch.manual_seed(42)
-                    # Use float32 to match baseline value_head dtype
-                    # Note: Only chunk_value_head uses float32, other tracevla components stay bfloat16
-                    # This works because FSDP handles a single float32 component correctly
+                    # Use bfloat16 to match tracevla components for FSDP compatibility
                     self.chunk_value_head = ValueHead(
                         input_dim=prefix_dim,  # 2048 for Pi0.5
                         hidden_sizes=value_head_hidden_sizes,
                         output_dim=1,
                         activation=value_head_activation,
                         bias_last=True,
-                    )
+                    ).to(dtype=_tracevla_dtype)
             else:
                 value_head_input_dim = proj_width
                 # Set fixed seed for reproducible value head initialization
@@ -1017,6 +1046,28 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                         prefix_mean.register_hook(zero_grad_hook)
                     prefix_embed = self.prefix_value_proj(prefix_mean)
                     value_input = torch.cat([prefix_embed, suffix_out_value, x0_embed], dim=-1)
+                elif self.config.tracevla_value_mode == "prefix_x0_t":
+                    # New mode: prefix + timestep + x0
+                    # No suffix_out, no noise action (x_t)
+                    assert prefix_output is not None, "prefix_output required for prefix_x0_t mode"
+
+                    # Prefix (detached)
+                    prefix_mean = prefix_output.mean(dim=1).to(dtype=x0_proj_dtype)  # [B, 2048]
+                    if self.config.detach_critic_input or detach_value_input:
+                        prefix_mean.register_hook(zero_grad_hook)
+
+                    # Compress prefix if configured
+                    if self.config.prefix_x0_t_compress_dim is not None:
+                        prefix_embed = self.prefix_x0_t_proj(prefix_mean)  # [B, compress_dim]
+                    else:
+                        prefix_embed = prefix_mean  # [B, 2048] uncompressed
+
+                    # Timestep embedding
+                    t_for_value = t_input.unsqueeze(-1).to(dtype=x0_proj_dtype)  # [B, 1]
+                    t_embed_value = self.timestep_value_proj(t_for_value)  # [B, 64]
+
+                    # Concatenate: prefix + timestep + x0
+                    value_input = torch.cat([prefix_embed, t_embed_value, x0_embed], dim=-1)
                 else:
                     raise ValueError(f"Unknown tracevla_value_mode: {self.config.tracevla_value_mode}")
 
@@ -1072,7 +1123,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         x_t_mean = x0_pred * x0_weight + x1_pred * x1_weight
 
         if return_x0_pred:
-            return x_t_mean, x_t_std, value_t, x0_pred
+            return x_t_mean, x_t_std, value_t, x0_pred.detach()
         return x_t_mean, x_t_std, value_t
 
     def get_suffix_out(

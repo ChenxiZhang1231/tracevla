@@ -657,10 +657,12 @@ def compute_hierarchical_actor_critic_loss(
     chunk_actor_coef: float = 0.0,
     step_actor_coef: float = 1.0,
     use_bilevel_actor: bool = False,
+    step_actor_lr_scale: float = 1.0,  # NEW: Scale gradients for step actor
     # Step weighting
     step_weights: torch.Tensor = None,
     uncertainty_mode: str = "linear",
     use_uncertainty_weighting: bool = False,
+    step_sample_ratio: float = 1.0,  # NEW: Ratio of steps to sample for training (0.0-1.0)
     # Masking and scaling
     loss_mask: torch.Tensor = None,
     loss_mask_sum: torch.Tensor = None,
@@ -801,11 +803,24 @@ def compute_hierarchical_actor_critic_loss(
     # ===== 3. Step-Level Critic Loss (optional) =====
     # Note: Skip during chunk_value_warmup (phase 1: only chunk_value trains)
     # Phase 2 (critic_warmup but not chunk_value_warmup): step_value trains with chunk_value
-    if step_value_coef > 0 and stepwise_values is not None and step_returns is not None and not chunk_value_warmup:
+    # Also skip if step_sample_ratio is 0 (no step sampling)
+    if step_value_coef > 0 and stepwise_values is not None and step_returns is not None and not chunk_value_warmup and step_sample_ratio > 0:
         # Flatten for processing: [B, num_chunks, T] -> [B*num_chunks, T] or similar
         stepwise_values_flat = stepwise_values.reshape(-1, stepwise_values.shape[-1]) if stepwise_values.dim() > 2 else stepwise_values
         stepwise_prev_values_flat = stepwise_prev_values.reshape(-1, stepwise_prev_values.shape[-1]) if stepwise_prev_values.dim() > 2 else stepwise_prev_values
         step_returns_flat = step_returns.reshape(-1, step_returns.shape[-1]) if step_returns.dim() > 2 else step_returns
+
+        # NEW: Random step sampling for memory efficiency
+        step_sample_mask_value = None
+        if step_sample_ratio < 1.0:
+            num_steps = step_returns_flat.shape[-1]
+            num_sampled_steps = max(1, int(num_steps * step_sample_ratio))
+
+            # Create random mask: [B*num_chunks, T]
+            step_sample_mask_value = torch.zeros_like(step_returns_flat, dtype=torch.bool)
+            for i in range(step_sample_mask_value.shape[0]):
+                sampled_indices = torch.randperm(num_steps, device=step_returns_flat.device)[:num_sampled_steps]
+                step_sample_mask_value[i, sampled_indices] = True
 
         step_pred_clipped = stepwise_prev_values_flat + (
             stepwise_values_flat - stepwise_prev_values_flat
@@ -814,6 +829,10 @@ def compute_hierarchical_actor_critic_loss(
         step_loss_orig = huber_loss(step_returns_flat - stepwise_values_flat, huber_delta)
         step_loss_clip = huber_loss(step_returns_flat - step_pred_clipped, huber_delta)
         step_critic_loss_per_step = torch.max(step_loss_orig, step_loss_clip)
+
+        # Apply step sampling mask if enabled
+        if step_sample_mask_value is not None:
+            step_critic_loss_per_step = step_critic_loss_per_step * step_sample_mask_value.float()
 
         # Apply uncertainty weighting if enabled
         if use_uncertainty_weighting and step_weights is not None:
@@ -841,11 +860,27 @@ def compute_hierarchical_actor_critic_loss(
 
     # ===== 4. Step-Level Actor Loss (hierarchical) =====
     # Note: Skip during critic_warmup to let chunk_value stabilize first
-    if step_actor_coef > 0 and stepwise_logprobs is not None and step_advantages is not None and not critic_warmup:
+    # Also skip if step_sample_ratio is 0 (no step sampling)
+    if step_actor_coef > 0 and stepwise_logprobs is not None and step_advantages is not None and not critic_warmup and step_sample_ratio > 0:
         # Flatten logprobs: [B, num_chunks, T, action_chunk, action_dim] -> [B*num_chunks, T, ...]
         stepwise_logprobs_flat = stepwise_logprobs.reshape(-1, *stepwise_logprobs.shape[-3:]) if stepwise_logprobs.dim() > 4 else stepwise_logprobs
         stepwise_old_logprobs_flat = stepwise_old_logprobs.reshape(-1, *stepwise_old_logprobs.shape[-3:]) if stepwise_old_logprobs.dim() > 4 else stepwise_old_logprobs
         step_advantages_flat = step_advantages.reshape(-1, step_advantages.shape[-1]) if step_advantages.dim() > 2 else step_advantages
+
+        # NEW: Random step sampling for memory efficiency
+        # Sample a subset of denoise steps to compute gradients on
+        if step_sample_ratio < 1.0:
+            num_steps = step_advantages_flat.shape[-1]
+            num_sampled_steps = max(1, int(num_steps * step_sample_ratio))
+
+            # Create random mask: [B*num_chunks, T]
+            step_sample_mask = torch.zeros_like(step_advantages_flat, dtype=torch.bool)
+            for i in range(step_sample_mask.shape[0]):
+                sampled_indices = torch.randperm(num_steps, device=step_advantages_flat.device)[:num_sampled_steps]
+                step_sample_mask[i, sampled_indices] = True
+
+            # Apply mask to advantages (zero out non-sampled steps)
+            step_advantages_flat = step_advantages_flat * step_sample_mask.float()
 
         # Sum logprobs over action dimensions: [..., T, action_chunk, action_dim] -> [..., T]
         logprobs_sum = stepwise_logprobs_flat.sum(dim=(-1, -2)) if stepwise_logprobs_flat.dim() >= 3 else stepwise_logprobs_flat.sum(dim=-1)
@@ -876,8 +911,14 @@ def compute_hierarchical_actor_critic_loss(
             else:
                 actor_loss = policy_loss_per_step.mean()
 
+        # Apply gradient scaling to simulate different learning rate
+        if step_actor_lr_scale != 1.0:
+            actor_loss = actor_loss * step_actor_lr_scale
+
         total_loss = total_loss + step_actor_coef * actor_loss
         metrics["actor/hierarchical_policy_loss"] = actor_loss.detach()
+        if step_actor_lr_scale != 1.0:
+            metrics["actor/hierarchical_lr_scale"] = step_actor_lr_scale
 
         with torch.no_grad():
             metrics["actor/hierarchical_approx_kl"] = log_ratio.mean().detach()
@@ -885,5 +926,218 @@ def compute_hierarchical_actor_critic_loss(
             metrics["actor/hierarchical_ratio"] = ratio.mean().detach()
 
     metrics["loss/hierarchical_total"] = total_loss.detach()
+    return total_loss, metrics
+
+
+@register_policy_loss("hierarchical_q_maximization")
+def compute_hierarchical_q_maximization_loss(
+    # Chunk-level inputs
+    chunk_values: torch.Tensor = None,
+    chunk_prev_values: torch.Tensor = None,
+    chunk_returns: torch.Tensor = None,
+    # Step-level inputs
+    stepwise_values: torch.Tensor = None,
+    stepwise_prev_values: torch.Tensor = None,
+    step_returns: torch.Tensor = None,
+    # Loss hyperparameters
+    value_clip: float = 0.2,
+    huber_delta: float = 10.0,
+    # Coefficients
+    chunk_value_coef: float = 1.0,
+    step_value_coef: float = 1.0,
+    step_actor_coef: float = 1.0,
+    # Q-maximization parameters
+    q_weight_mode: str = "constant",
+    q_weight_value: float = 1.0,
+    q_timestep_schedule: str = "linear",
+    q_value_normalization: bool = False,
+    step_actor_lr_scale: float = 1.0,  # NEW: Scale gradients for step actor (simulates different LR)
+    # Step weighting
+    step_weights: torch.Tensor = None,
+    use_uncertainty_weighting: bool = False,
+    # Masking and scaling
+    loss_mask: torch.Tensor = None,
+    loss_mask_sum: torch.Tensor = None,
+    max_episode_steps: int = None,
+    critic_warmup: bool = False,
+    chunk_value_warmup: bool = False,
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Compute Hierarchical Q-Maximization Loss.
+
+    This loss function directly maximizes Q-values instead of using PPO-style advantages:
+    L_Policy(θ) = -E_{t, x_t} [w(t) · Q_φ(s, â_t)]
+
+    Components:
+    1. Chunk-level critic loss (trains chunk value head)
+    2. Step-level critic loss (trains Q-values to match chunk-level credit)
+    3. Step-level actor loss (NEW: maximizes Q-values directly)
+
+    Args:
+        q_weight_mode: Weighting mode - "constant", "timestep", or "uncertainty"
+        q_weight_value: Weight value when mode="constant" (default: 1.0)
+        q_timestep_schedule: Schedule for timestep weighting - "linear" or "quadratic"
+        q_value_normalization: Whether to normalize Q-values before maximization
+    """
+    metrics = {}
+    device = chunk_values.device if chunk_values is not None else stepwise_values.device
+    total_loss = torch.tensor(0.0, device=device)
+
+    # Get dimensions
+    if stepwise_values is not None:
+        if stepwise_values.dim() == 3:
+            B, num_chunks, T = stepwise_values.shape
+        else:
+            B = stepwise_values.shape[0]
+            num_chunks = 1
+            T = stepwise_values.shape[1] if stepwise_values.dim() > 1 else 1
+
+    # Determine loss aggregation function
+    use_loss_scaling = (
+        max_episode_steps is not None
+        and loss_mask_sum is not None
+        and loss_mask is not None
+    )
+    if use_loss_scaling:
+        loss_mask_ratio = (loss_mask_sum * 1.0) / max_episode_steps
+    else:
+        loss_mask_ratio = None
+
+    # Prepare chunk_loss_mask (reduce to [B] if needed)
+    chunk_loss_mask = loss_mask
+    chunk_loss_mask_ratio = loss_mask_ratio
+    if loss_mask is not None and loss_mask.dim() > 1:
+        chunk_loss_mask = loss_mask.any(dim=-1).float()
+        if loss_mask_ratio is not None:
+            chunk_loss_mask_ratio = loss_mask_ratio.float().mean(dim=-1)
+
+    # ===== 1. Chunk-Level Critic Loss =====
+    if chunk_values is not None and chunk_returns is not None:
+        chunk_loss_mask_sum = None
+        if loss_mask_sum is not None:
+            loss_mask_sum_float = loss_mask_sum.float()
+            if loss_mask_sum_float.dim() > 1:
+                chunk_loss_mask_sum = loss_mask_sum_float.mean(dim=-1)
+            else:
+                chunk_loss_mask_sum = loss_mask_sum_float
+
+        chunk_critic_loss, chunk_critic_metrics = compute_ppo_critic_loss(
+            values=chunk_values,
+            returns=chunk_returns,
+            prev_values=chunk_prev_values,
+            value_clip=value_clip,
+            huber_delta=huber_delta,
+            loss_mask=chunk_loss_mask.bool() if chunk_loss_mask is not None else None,
+            max_episode_steps=max_episode_steps,
+            loss_mask_sum=chunk_loss_mask_sum,
+        )
+
+        total_loss = total_loss + chunk_value_coef * chunk_critic_loss
+        for k, v in chunk_critic_metrics.items():
+            metrics[k.replace("critic/", "critic/chunk_")] = v
+
+    # ===== 2. Step-Level Critic Loss =====
+    if step_value_coef > 0 and stepwise_values is not None and step_returns is not None and not chunk_value_warmup:
+        stepwise_values_flat = stepwise_values.reshape(-1, stepwise_values.shape[-1]) if stepwise_values.dim() > 2 else stepwise_values
+        stepwise_prev_values_flat = stepwise_prev_values.reshape(-1, stepwise_prev_values.shape[-1]) if stepwise_prev_values.dim() > 2 else stepwise_prev_values
+        step_returns_flat = step_returns.reshape(-1, step_returns.shape[-1]) if step_returns.dim() > 2 else step_returns
+
+        step_pred_clipped = stepwise_prev_values_flat + (
+            stepwise_values_flat - stepwise_prev_values_flat
+        ).clamp(-value_clip, value_clip)
+
+        step_loss_orig = huber_loss(step_returns_flat - stepwise_values_flat, huber_delta)
+        step_loss_clip = huber_loss(step_returns_flat - step_pred_clipped, huber_delta)
+        step_critic_loss_per_step = torch.max(step_loss_orig, step_loss_clip)
+
+        if use_uncertainty_weighting and step_weights is not None:
+            step_weights_flat = step_weights.reshape(-1, step_weights.shape[-1]) if step_weights.dim() > 2 else step_weights
+            if step_weights_flat.shape != step_critic_loss_per_step.shape:
+                step_weights_flat = step_weights_flat.expand_as(step_critic_loss_per_step)
+            weighted_step_critic = step_critic_loss_per_step * step_weights_flat
+            weight_sum = step_weights_flat.sum().clamp(min=1)
+            step_critic_loss = weighted_step_critic.sum() / weight_sum
+            metrics["uncertainty/q_max_weight_mean"] = step_weights_flat.mean().detach()
+            metrics["uncertainty/q_max_weight_std"] = step_weights_flat.std().detach()
+        else:
+            step_critic_loss = step_critic_loss_per_step.mean()
+
+        total_loss = total_loss + step_value_coef * step_critic_loss
+        metrics["critic/q_max_step_value_loss"] = step_critic_loss.detach()
+
+        with torch.no_grad():
+            returns_var = step_returns_flat.var()
+            if returns_var > 1e-8:
+                residual_var = (step_returns_flat - stepwise_values_flat).var()
+                explained_var = 1 - residual_var / returns_var
+                metrics["critic/q_max_explained_variance"] = explained_var.detach()
+
+    # ===== 3. Step-Level Actor Loss (Q-Maximization) =====
+    if step_actor_coef > 0 and stepwise_values is not None and not critic_warmup:
+        # Flatten Q-values: [B, num_chunks, T] -> [B*num_chunks, T]
+        stepwise_values_flat = stepwise_values.reshape(-1, stepwise_values.shape[-1]) if stepwise_values.dim() > 2 else stepwise_values
+
+        # Compute weights w(t)
+        if q_weight_mode == "constant":
+            weights = torch.full_like(stepwise_values_flat, q_weight_value)
+        elif q_weight_mode == "timestep":
+            # Create timestep weights: t/T (linear) or (t/T)^2 (quadratic)
+            t_indices = torch.arange(T, device=device, dtype=torch.float32)
+            if q_timestep_schedule == "linear":
+                timestep_weights = t_indices / (T - 1) if T > 1 else torch.ones_like(t_indices)
+            elif q_timestep_schedule == "quadratic":
+                timestep_weights = (t_indices / (T - 1)) ** 2 if T > 1 else torch.ones_like(t_indices)
+            else:
+                timestep_weights = torch.ones_like(t_indices)
+            weights = timestep_weights.unsqueeze(0).expand_as(stepwise_values_flat)
+        elif q_weight_mode == "uncertainty":
+            if step_weights is not None:
+                step_weights_flat = step_weights.reshape(-1, step_weights.shape[-1]) if step_weights.dim() > 2 else step_weights
+                weights = step_weights_flat.expand_as(stepwise_values_flat) if step_weights_flat.shape != stepwise_values_flat.shape else step_weights_flat
+            else:
+                weights = torch.ones_like(stepwise_values_flat)
+        else:
+            weights = torch.ones_like(stepwise_values_flat)
+
+        # Optional: Normalize Q-values
+        q_values = stepwise_values_flat
+        if q_value_normalization:
+            q_mean = q_values.mean()
+            q_std = q_values.std().clamp(min=1e-8)
+            q_values = (q_values - q_mean) / q_std
+            metrics["actor/q_max_q_mean_before_norm"] = q_mean.detach()
+            metrics["actor/q_max_q_std_before_norm"] = q_std.detach()
+
+        # Q-maximization loss: -E[w(t) * Q(s, a_t)]
+        weighted_q_values = weights * q_values
+
+        # Apply loss mask if available
+        if loss_mask is not None:
+            flat_mask = loss_mask.reshape(-1) if loss_mask.dim() > 1 else loss_mask
+            if flat_mask.shape[0] == weighted_q_values.shape[0]:
+                flat_mask = flat_mask.unsqueeze(-1).expand_as(weighted_q_values)
+            actor_loss = -(weighted_q_values * flat_mask).sum() / flat_mask.sum().clamp(min=1)
+        else:
+            actor_loss = -weighted_q_values.mean()
+
+        # Apply gradient scaling to simulate different learning rate
+        # This scales the gradients flowing back through the actor loss
+        if step_actor_lr_scale != 1.0:
+            actor_loss = actor_loss * step_actor_lr_scale
+
+        total_loss = total_loss + step_actor_coef * actor_loss
+        metrics["actor/q_max_policy_loss"] = actor_loss.detach()
+        metrics["actor/q_max_lr_scale"] = step_actor_lr_scale
+
+        # Log Q-value statistics
+        with torch.no_grad():
+            metrics["actor/q_max_q_mean"] = q_values.mean().detach()
+            metrics["actor/q_max_q_std"] = q_values.std().detach()
+            metrics["actor/q_max_q_min"] = q_values.min().detach()
+            metrics["actor/q_max_q_max"] = q_values.max().detach()
+            metrics["actor/q_max_weight_mean"] = weights.mean().detach()
+
+    metrics["loss/q_max_total"] = total_loss.detach()
     return total_loss, metrics
 
