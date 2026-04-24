@@ -357,12 +357,13 @@ class CollectEpisode(gym.Wrapper):
             if ep_data is not None:
                 self._submit(self._write_lerobot_episode, ep_data)
         else:
+            task_desc = self._extract_task_description(buf, env_idx)
             episode_data = self._copy(
                 {
                     "rank": self.rank,
                     "env_idx": env_idx,
                     "episode_id": self._episode_ids[env_idx],
-                    "step": self._global_step,
+                    "task_description": task_desc,
                     "success": is_success,
                     "observations": buf["observations"],
                     "actions": buf["actions"],
@@ -373,11 +374,10 @@ class CollectEpisode(gym.Wrapper):
                 }
             )
             label = "success" if is_success else "fail"
+            task_slug = task_desc.replace(" ", "_").replace("/", "_")[:80]
             filename = (
                 f"rank_{self.rank}_env_{env_idx}_"
-                f"episode_{self._episode_ids[env_idx]}_"
-                f"step_{self._global_step}_"
-                f"{label}.pkl"
+                f"episode_{self._episode_ids[env_idx]}_{label}_{task_slug}.pkl"
             )
             self._submit(
                 self._write_pickle, os.path.join(self.save_dir, filename), episode_data

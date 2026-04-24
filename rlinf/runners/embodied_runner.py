@@ -172,7 +172,7 @@ class EmbodiedRunner:
         env_results = env_handle.wait()
         rollout_handle.wait()
         eval_metrics_list = [results for results in env_results if results is not None]
-        eval_metrics = compute_evaluate_metrics(eval_metrics_list)
+        eval_metrics, _ = compute_evaluate_metrics(eval_metrics_list)
         return eval_metrics
 
     def _log_ranked_metrics(
@@ -255,14 +255,14 @@ class EmbodiedRunner:
                 per_rank_metrics[int(rank)].append(metrics)
 
         aggregated_metrics = (
-            compute_evaluate_metrics(metric_list) if metric_list else {}
+            compute_evaluate_metrics(metric_list)[0] if metric_list else {}
         )
         ranked_metrics_list: list[dict] = []
         if per_rank_metrics:
             max_rank = max(per_rank_metrics.keys())
             ranked_metrics_list = [{} for _ in range(max_rank + 1)]
             for rank, metrics_list in per_rank_metrics.items():
-                ranked_metrics_list[rank] = compute_evaluate_metrics(metrics_list)
+                ranked_metrics_list[rank] = compute_evaluate_metrics(metrics_list)[0]
         return aggregated_metrics, ranked_metrics_list
 
     def run(self):
@@ -366,7 +366,7 @@ class EmbodiedRunner:
                 results for results in env_results if results is not None
             ]
 
-            env_metrics = compute_evaluate_metrics(env_results_list)
+            env_metrics = compute_evaluate_metrics(env_results_list)[0]
             env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
             ranked_env_results = [
                 {"rank": rank, "env": rank_metrics}

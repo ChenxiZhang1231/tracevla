@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 import typing
 
 from rlinf.scheduler import Channel
@@ -71,11 +73,36 @@ class EmbodiedEvalRunner:
         env_results = env_handle.wait()
         rollout_handle.wait()
         eval_metrics_list = [results for results in env_results if results is not None]
-        eval_metrics = compute_evaluate_metrics(eval_metrics_list)
-        return eval_metrics
+        eval_metrics, raw_success_lens = compute_evaluate_metrics(eval_metrics_list)
+        return eval_metrics, raw_success_lens
 
     def run(self):
-        eval_metrics = self.evaluate()
+        eval_metrics, raw_success_lens = self.evaluate()
+
+        # Log successful trajectory length stats (computed in compute_evaluate_metrics)
+        count = eval_metrics.get("success_episode_len_count", 0)
+        if count > 0:
+            self.logger.info(
+                f"Success traj lengths ({count} episodes): "
+                f"mean={eval_metrics['success_episode_len_mean']:.1f}, "
+                f"min={eval_metrics['success_episode_len_min']:.0f}, "
+                f"max={eval_metrics['success_episode_len_max']:.0f}"
+            )
+
+        # Write per-episode success lengths to file
+        if raw_success_lens is not None:
+            log_path = self.cfg.runner.logger.log_path
+            save_dir = os.path.join(log_path, "eval_trajs")
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, "success_episode_lengths.json")
+            with open(save_path, "w") as f:
+                json.dump(
+                    {"success_episode_lengths": raw_success_lens},
+                    f,
+                    indent=2,
+                )
+            self.logger.info(f"Saved success episode lengths to {save_path}")
+
         eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
         self.logger.info(eval_metrics)
         self.metric_logger.log(step=0, data=eval_metrics)

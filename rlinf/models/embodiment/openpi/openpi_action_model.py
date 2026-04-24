@@ -70,11 +70,16 @@ class OpenPi0Config(Pi0Config):
     # ===== Trace-VLA parameters =====
     use_tracevla_value: bool = False  # Use Tweedie x0_pred for value head input
     x0_value_embed_dim: int = 256     # Embedding dimension for x0_pred projection
-    # Value head mode: "suffix_x0", "full_concat", "compressed_concat", "prefix_x0_t"
+    # Value head mode: "suffix_x0", "full_concat", "compressed_concat", "prefix_x0_t", "film", "cross_attention"
     tracevla_value_mode: str = "suffix_x0"
-    prefix_value_embed_dim: int = 512  # For compressed_concat mode
+    prefix_value_embed_dim: int = 512  # For compressed_concat / film mode
     # For prefix_x0_t mode: if None, use uncompressed prefix (2048); otherwise compress to this dim
     prefix_x0_t_compress_dim: int = None  # None = no compression, or specify dim (e.g., 512)
+
+    # ===== Value head architecture parameters =====
+    value_head_num_layers: int = 0      # 0 = auto (use default), >0 = auto-generate widths with this depth
+    value_ca_head_dim: int = 256        # Cross-attention head dimension
+    value_ca_num_heads: int = 4         # Number of attention heads for cross-attention mode
 
     # ===== DSRL-specific parameters =====
     use_dsrl: bool = False  # Enable DSRL algorithm
@@ -201,8 +206,37 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                         bias=True
                     ).to(dtype=_tracevla_dtype)
                     value_head_input_dim = self.config.prefix_value_embed_dim + suffix_dim + self.config.x0_value_embed_dim
+                elif self.config.tracevla_value_mode == "prefix_xt_vt":
+                    # Mode: compressed_prefix + x_t + v_t
+                    # No suffix_out, no x0_pred
+                    self.prefix_value_proj = nn.Linear(
+                        prefix_dim,
+                        self.config.prefix_value_embed_dim,
+                        bias=True
+                    ).to(dtype=_tracevla_dtype)
+                    # Project x_t (noisy action) to embedding
+                    self.xt_value_proj = nn.Linear(
+                        x0_flat_dim,
+                        self.config.x0_value_embed_dim,
+                        bias=True
+                    ).to(dtype=_tracevla_dtype)
+                    # Project v_t (velocity) to embedding
+                    self.vt_value_proj = nn.Linear(
+                        x0_flat_dim,
+                        self.config.x0_value_embed_dim,
+                        bias=True
+                    ).to(dtype=_tracevla_dtype)
+                    value_head_input_dim = (
+                        self.config.prefix_value_embed_dim
+                        + self.config.x0_value_embed_dim
+                        + self.config.x0_value_embed_dim
+                    )
+                elif self.config.tracevla_value_mode == "full_prefix_x0":
+                    # Mode: full prefix (2048, no compression) + x0_pred
+                    # No suffix_out, no x_t, no v_t
+                    value_head_input_dim = prefix_dim + self.config.x0_value_embed_dim
                 elif self.config.tracevla_value_mode == "prefix_x0_t":
-                    # New mode: prefix + timestep + x0
+                    # prefix + timestep + x0
                     # No suffix_out, no noise action (x_t)
                     timestep_embed_dim = 64
 
@@ -223,8 +257,74 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                         # Uncompressed prefix mode (default)
                         value_head_input_dim = prefix_dim + timestep_embed_dim + self.config.x0_value_embed_dim
                         # = 2048 + 64 + 256 = 2368
+                elif self.config.tracevla_value_mode == "film":
+                    # FiLM conditioning: action features generate γ/β to modulate prefix
+                    # Prefix projection
+                    self.prefix_value_proj = nn.Linear(
+                        prefix_dim,
+                        self.config.prefix_value_embed_dim,
+                        bias=True
+                    ).to(dtype=_tracevla_dtype)
+                    # FiLM generator: action embed → (gamma, beta)
+                    timestep_embed_dim = 64
+                    film_action_dim = self.config.x0_value_embed_dim + timestep_embed_dim
+                    self.film_gen = nn.Linear(
+                        film_action_dim,
+                        self.config.prefix_value_embed_dim * 2,
+                        bias=True
+                    ).to(dtype=_tracevla_dtype)
+                    # Initialize FiLM so gamma ≈ 1, beta ≈ 0 (identity-like)
+                    # weight → 0 makes output ≈ bias, so set bias to [1,1,...,0,0,...]
+                    with torch.no_grad():
+                        nn.init.zeros_(self.film_gen.weight)
+                        film_bias = torch.zeros(self.config.prefix_value_embed_dim * 2)
+                        film_bias[:self.config.prefix_value_embed_dim] = 1.0  # gamma = 1
+                        # beta = 0 (already zero)
+                        self.film_gen.bias.copy_(film_bias)
+                    # Value head on conditioned features
+                    value_head_input_dim = self.config.prefix_value_embed_dim
+                elif self.config.tracevla_value_mode == "cross_attention":
+                    # Cross-attention: action as query, prefix tokens as key/value
+                    ca_head_dim = self.config.value_ca_head_dim
+                    # Action projection for query
+                    timestep_embed_dim = 64
+                    ca_action_dim = self.config.x0_value_embed_dim + timestep_embed_dim
+                    self.ca_action_proj = nn.Linear(
+                        ca_action_dim,
+                        ca_head_dim,
+                        bias=True
+                    ).to(dtype=_tracevla_dtype)
+                    # Key/value projection from prefix tokens
+                    self.ca_kv_proj = nn.Linear(
+                        prefix_dim,
+                        ca_head_dim,
+                        bias=True
+                    ).to(dtype=_tracevla_dtype)
+                    # Multi-head cross-attention
+                    self.cross_attn = nn.MultiheadAttention(
+                        embed_dim=ca_head_dim,
+                        num_heads=self.config.value_ca_num_heads,
+                        batch_first=True,
+                    ).to(dtype=_tracevla_dtype)
+                    # Output projection after attention
+                    self.ca_out_proj = nn.Linear(
+                        ca_head_dim,
+                        ca_head_dim,
+                        bias=True
+                    ).to(dtype=_tracevla_dtype)
+                    # Value head on attention output
+                    value_head_input_dim = ca_head_dim
                 else:
                     raise ValueError(f"Unknown tracevla_value_mode: {self.config.tracevla_value_mode}")
+
+                # Apply value_head_num_layers override if set
+                if self.config.value_head_num_layers > 0:
+                    n = self.config.value_head_num_layers
+                    # Auto-generate widths: halve each layer, min 64
+                    value_head_hidden_sizes = tuple(
+                        max(value_head_input_dim // (2 ** (i + 1)), 64)
+                        for i in range(n)
+                    )
 
                 # Step Value head (tracevla) with bfloat16 to match backbone
                 self.value_head = ValueHead(
@@ -1046,10 +1146,34 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                         prefix_mean.register_hook(zero_grad_hook)
                     prefix_embed = self.prefix_value_proj(prefix_mean)
                     value_input = torch.cat([prefix_embed, suffix_out_value, x0_embed], dim=-1)
+                elif self.config.tracevla_value_mode == "prefix_xt_vt":
+                    # Mode: compressed_prefix + x_t + v_t
+                    assert prefix_output is not None, "prefix_output required for prefix_xt_vt mode"
+                    # Compressed prefix
+                    prefix_mean = prefix_output.mean(dim=1).to(dtype=x0_proj_dtype)
+                    if self.config.detach_critic_input or detach_value_input:
+                        prefix_mean.register_hook(zero_grad_hook)
+                    prefix_embed = self.prefix_value_proj(prefix_mean)
+                    # x_t embedding (detached)
+                    x_t_detached = x_t.detach()
+                    x_t_flat = x_t_detached.view(bsize, -1).to(dtype=x0_proj_dtype)
+                    x_t_embed = self.xt_value_proj(x_t_flat)
+                    # v_t embedding (detached)
+                    v_t_detached = v_t.detach()
+                    v_t_flat = v_t_detached.view(bsize, -1).to(dtype=x0_proj_dtype)
+                    v_t_embed = self.vt_value_proj(v_t_flat)
+                    # Concatenate
+                    value_input = torch.cat([prefix_embed, x_t_embed, v_t_embed], dim=-1)
+                elif self.config.tracevla_value_mode == "full_prefix_x0":
+                    # Mode: full prefix (2048) + x0_pred (256)
+                    assert prefix_output is not None, "prefix_output required for full_prefix_x0 mode"
+                    # Full prefix (no compression)
+                    prefix_mean = prefix_output.mean(dim=1).to(dtype=x0_proj_dtype)  # [B, 2048]
+                    if self.config.detach_critic_input or detach_value_input:
+                        prefix_mean.register_hook(zero_grad_hook)
+                    # Concatenate prefix + x0
+                    value_input = torch.cat([prefix_mean, x0_embed], dim=-1)
                 elif self.config.tracevla_value_mode == "prefix_x0_t":
-                    # New mode: prefix + timestep + x0
-                    # No suffix_out, no noise action (x_t)
-                    assert prefix_output is not None, "prefix_output required for prefix_x0_t mode"
 
                     # Prefix (detached)
                     prefix_mean = prefix_output.mean(dim=1).to(dtype=x0_proj_dtype)  # [B, 2048]
@@ -1068,11 +1192,58 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
                     # Concatenate: prefix + timestep + x0
                     value_input = torch.cat([prefix_embed, t_embed_value, x0_embed], dim=-1)
+                elif self.config.tracevla_value_mode == "film":
+                    # FiLM conditioning: action features modulate prefix
+                    assert prefix_output is not None, "prefix_output required for film mode"
+                    prefix_mean = prefix_output.mean(dim=1).to(dtype=x0_proj_dtype)  # [B, 2048]
+                    if self.config.detach_critic_input or detach_value_input:
+                        prefix_mean.register_hook(zero_grad_hook)
+
+                    # Compress prefix
+                    prefix_embed = self.prefix_value_proj(prefix_mean)  # [B, 512]
+
+                    # Action embedding: x0 + timestep
+                    t_for_value = t_input.unsqueeze(-1).to(dtype=x0_proj_dtype)  # [B, 1]
+                    t_embed_value = self.timestep_value_proj(t_for_value)  # [B, 64]
+                    action_embed = torch.cat([x0_embed, t_embed_value], dim=-1)  # [B, 320]
+
+                    # Generate FiLM parameters
+                    film_params = self.film_gen(action_embed)  # [B, 1024]
+                    gamma, beta = film_params.chunk(2, dim=-1)  # each [B, 512]
+
+                    # Modulate prefix features
+                    conditioned = gamma * prefix_embed + beta  # [B, 512]
+
+                    # Compute value from conditioned features
+                    value_t = self.value_head(conditioned)[:, 0]
+                elif self.config.tracevla_value_mode == "cross_attention":
+                    # Cross-attention: action as query, prefix tokens as key/value
+                    assert prefix_output is not None, "prefix_output required for cross_attention mode"
+
+                    # Action query: x0 + timestep
+                    t_for_value = t_input.unsqueeze(-1).to(dtype=x0_proj_dtype)  # [B, 1]
+                    t_embed_value = self.timestep_value_proj(t_for_value)  # [B, 64]
+                    action_embed = torch.cat([x0_embed, t_embed_value], dim=-1)  # [B, 320]
+                    query = self.ca_action_proj(action_embed).unsqueeze(1)  # [B, 1, 256]
+
+                    # Key/value from prefix tokens (NOT mean-pooled)
+                    prefix_tokens = prefix_output.to(dtype=x0_proj_dtype)  # [B, seq_len, 2048]
+                    if self.config.detach_critic_input or detach_value_input:
+                        prefix_tokens.register_hook(zero_grad_hook)
+                    kv = self.ca_kv_proj(prefix_tokens)  # [B, seq_len, 256]
+
+                    # Cross-attention
+                    attn_out, _ = self.cross_attn(query, kv, kv)  # [B, 1, 256]
+                    attn_out = self.ca_out_proj(attn_out.squeeze(1))  # [B, 256]
+
+                    # Compute value from attention output
+                    value_t = self.value_head(attn_out)[:, 0]
                 else:
                     raise ValueError(f"Unknown tracevla_value_mode: {self.config.tracevla_value_mode}")
 
-                # Step 6: Compute value
-                value_t = self.value_head(value_input)[:, 0]
+                # Step 6: Compute value (only for concat-based modes)
+                if self.config.tracevla_value_mode not in ("film", "cross_attention"):
+                    value_t = self.value_head(value_input)[:, 0]
             else:
                 # Original value computation
                 if self.config.chunk_critic_input:

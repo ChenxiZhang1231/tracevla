@@ -99,19 +99,35 @@ def compute_evaluate_metrics(eval_metrics_list):
         if metric:
             all_eval_metrics[env_info_key] = metric
 
-    for key in all_eval_metrics:
-        shards = [_normalize_metric_shard(s) for s in all_eval_metrics[key]]
-        stacked = torch.concat(shards).float()
-        all_eval_metrics[key] = (
-            stacked.mean().detach().cpu().numpy()
-            if stacked.numel() > 0
-            else np.asarray(0.0, dtype=np.float64)
-        )
+    special_keys = {"success_episode_len"}
+    raw_success_lens = None
+    for key in list(all_eval_metrics.keys()):
+        if key in special_keys:
+            # Special handling: filter out zeros (non-success entries),
+            # then compute mean/min/max/count of actual success episode lengths
+            all_vals = torch.concat(all_eval_metrics[key]).float()
+            success_vals = all_vals[all_vals > 0]
+            if len(success_vals) > 0:
+                all_eval_metrics[f"{key}_mean"] = success_vals.mean().item()
+                all_eval_metrics[f"{key}_min"] = success_vals.min().item()
+                all_eval_metrics[f"{key}_max"] = success_vals.max().item()
+                all_eval_metrics[f"{key}_count"] = len(success_vals)
+                raw_success_lens = success_vals.sort().values.tolist()
+            else:
+                all_eval_metrics[f"{key}_mean"] = 0.0
+                all_eval_metrics[f"{key}_min"] = 0.0
+                all_eval_metrics[f"{key}_max"] = 0.0
+                all_eval_metrics[f"{key}_count"] = 0
+            del all_eval_metrics[key]
+        else:
+            all_eval_metrics[key] = (
+                torch.concat(all_eval_metrics[key]).float().mean().numpy()
+            )
 
     # Add total trajectory count to metrics
     all_eval_metrics["num_trajectories"] = sum(trajectory_counts)
 
-    return all_eval_metrics
+    return all_eval_metrics, raw_success_lens
 
 
 def compute_rollout_metrics(data_buffer: dict) -> dict:

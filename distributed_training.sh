@@ -1,0 +1,2 @@
+source switch_env openpi
+bash examples/embodiment/run_embodiment.sh maniskill_value_cross_attn_pi05

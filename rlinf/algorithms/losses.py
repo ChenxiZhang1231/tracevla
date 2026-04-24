@@ -801,10 +801,10 @@ def compute_hierarchical_actor_critic_loss(
             metrics[k.replace("actor/", "actor/chunk_")] = v
 
     # ===== 3. Step-Level Critic Loss (optional) =====
-    # Note: Skip during chunk_value_warmup (phase 1: only chunk_value trains)
-    # Phase 2 (critic_warmup but not chunk_value_warmup): step_value trains with chunk_value
-    # Also skip if step_sample_ratio is 0 (no step sampling)
-    if step_value_coef > 0 and stepwise_values is not None and step_returns is not None and not chunk_value_warmup and step_sample_ratio > 0:
+    # Always compute and log the loss for monitoring, but only add to total_loss
+    # when NOT in chunk_value_warmup (phase 1: only chunk_value trains).
+    # Also skip computation if step_sample_ratio is 0 (no step sampling).
+    if step_value_coef > 0 and stepwise_values is not None and step_returns is not None and step_sample_ratio > 0:
         # Flatten for processing: [B, num_chunks, T] -> [B*num_chunks, T] or similar
         stepwise_values_flat = stepwise_values.reshape(-1, stepwise_values.shape[-1]) if stepwise_values.dim() > 2 else stepwise_values
         stepwise_prev_values_flat = stepwise_prev_values.reshape(-1, stepwise_prev_values.shape[-1]) if stepwise_prev_values.dim() > 2 else stepwise_prev_values
@@ -847,7 +847,7 @@ def compute_hierarchical_actor_critic_loss(
         else:
             step_critic_loss = step_critic_loss_per_step.mean()
 
-        total_loss = total_loss + step_value_coef * step_critic_loss
+        # Always log the metric for tensorboard monitoring
         metrics["critic/hierarchical_step_value_loss"] = step_critic_loss.detach()
 
         # Compute explained variance
@@ -857,6 +857,10 @@ def compute_hierarchical_actor_critic_loss(
                 residual_var = (step_returns_flat - stepwise_values_flat).var()
                 explained_var = 1 - residual_var / returns_var
                 metrics["critic/hierarchical_explained_variance"] = explained_var.detach()
+
+        # Only add to total_loss when NOT in chunk_value_warmup
+        if not chunk_value_warmup:
+            total_loss = total_loss + step_value_coef * step_critic_loss
 
     # ===== 4. Step-Level Actor Loss (hierarchical) =====
     # Note: Skip during critic_warmup to let chunk_value stabilize first

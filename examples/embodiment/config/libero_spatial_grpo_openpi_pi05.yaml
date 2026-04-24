@@ -3,7 +3,6 @@ defaults:
   - env/libero_spatial@env.eval
   - model/pi0_5@actor.model
   - training_backend/fsdp@actor.fsdp_config
-  - weight_syncer/patch_syncer@weight_syncer
   - override hydra/job_logging: stdout
 
 hydra:
@@ -113,7 +112,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model/RLinf-Pi05-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-LIBERO-SFT
+    model_path: "/inspire/hdd/global_user/zhangchenxi-253108310322/RLinf/10000"
     precision: ${actor.model.precision}
 
 actor:
@@ -126,7 +125,7 @@ actor:
 
   # Override the default values in model/pi0_5
   model:
-    model_path: "/path/to/model/RLinf-Pi05-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-LIBERO-SFT
+    model_path: "/inspire/hdd/global_user/zhangchenxi-253108310322/RLinf/10000"
     num_action_chunks: 5 # interface for the env
     num_steps: 3
 

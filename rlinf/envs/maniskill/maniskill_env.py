@@ -230,6 +230,12 @@ class ManiskillEnv(gym.Env):
         self.success_once = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
+        self._prev_success = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self._success_episode_len = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.float32
+        )
         self.fail_once = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
@@ -244,12 +250,16 @@ class ManiskillEnv(gym.Env):
             self.prev_step_reward[mask] = 0.0
             if self.record_metrics:
                 self.success_once[mask] = False
+                self._prev_success[mask] = False
+                self._success_episode_len[mask] = 0.0
                 self.fail_once[mask] = False
                 self.returns[mask] = 0
         else:
             self.prev_step_reward[:] = 0
             if self.record_metrics:
                 self.success_once[:] = False
+                self._prev_success[:] = False
+                self._success_episode_len[:] = 0.0
                 self.fail_once[:] = False
                 self.returns[:] = 0.0
 
@@ -259,6 +269,13 @@ class ManiskillEnv(gym.Env):
         if "success" in infos:
             self.success_once = self.success_once | infos["success"]
             episode_info["success_once"] = self.success_once.clone()
+            # Record episode length: persist the value from first success
+            success_now = infos["success"] & ~self._prev_success
+            self._success_episode_len = torch.where(
+                success_now, self.elapsed_steps.float(), self._success_episode_len
+            )
+            episode_info["success_episode_len"] = self._success_episode_len.clone()
+            self._prev_success = self.success_once.clone()
         if "fail" in infos:
             self.fail_once = self.fail_once | infos["fail"]
             episode_info["fail_once"] = self.fail_once.clone()
